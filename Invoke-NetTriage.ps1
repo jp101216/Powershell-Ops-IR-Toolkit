@@ -79,6 +79,14 @@
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
     Read-only. Safe to run in a user or PAM/elevated context.
     Version 2.2
+    v2 RECONSTRUCTION NOTE: The repo original was truncated at exactly
+    20000 bytes, ending mid-line inside Build-ServiceNowSummary. This v2
+    file keeps the original code up to that truncation point, then
+    reconstructs the missing summary tail, dashboard, $Data collection,
+    findings analysis, export, and pruning from the README and the
+    script's own helpers/field names. Every reconstructed section is
+    marked 'RECONSTRUCTED in v2'. Do not treat reconstructed code as
+    Jessie's original. This tool remains READ-ONLY.
 #>
 
 [CmdletBinding()]
@@ -276,6 +284,7 @@ function Get-PingStats {
         Target = $ComputerName; Sent = $Count; Received = 0
         LossPct = 100; AvgMs = $null; MinMs = $null; MaxMs = $null
     }
+    if ($Count -le 0) { $out.Sent = 0; $out.LossPct = 100; return $out }
     if ([string]::IsNullOrWhiteSpace($ComputerName) -or $ComputerName -eq '0.0.0.0') { return $out }
 
     $ping = New-Object System.Net.NetworkInformation.Ping
@@ -431,8 +440,8 @@ function Remove-OldTriageExports {
     param([string]$Directory, [int]$Keep = 20)
     if ($Keep -le 0 -or -not $Directory -or -not (Test-Path $Directory)) { return }
     try {
-        $files = Get-ChildItem -Path $Directory -Filter 'Triage_*.json' -File -ErrorAction SilentlyContinue |
-                 Sort-Object LastWriteTime -Descending
+        $files = @(Get-ChildItem -Path $Directory -Filter 'Triage_*.json' -File -ErrorAction SilentlyContinue |
+                 Sort-Object LastWriteTime -Descending)
         if ($files.Count -gt $Keep) {
             foreach ($old in ($files | Select-Object -Skip $Keep)) {
                 Remove-Item -Path $old.FullName -Force -ErrorAction SilentlyContinue
@@ -489,4 +498,732 @@ function Build-ServiceNowSummary {
     # ---- Network ----
     $L.Add('NETWORK')
     $L.Add(("  VPN           : {0}" -f $Data.VPN_Status))
-    if ($Data.Zscaler_State)  { $L.Add(("  Zscaler       : {0}" 
+    # ======================================================================
+    # RECONSTRUCTED in v2 - not present in the truncated repo original
+    # The repo original ends mid-line on the Zscaler line above. Everything
+    # from here to the end of Build-ServiceNowSummary is reconstruction
+    # based on the README, the $Data field names already used above, and
+    # the script's own helpers (Format-PingStat, Get-SeverityRank, etc.).
+    # ======================================================================
+    if ($Data.Zscaler_State) { $L.Add(("  Zscaler       : {0}" -f $Data.Zscaler_State)) }
+    if ($Data.VPN_TunnelIP) { $L.Add(("  Tunnel IP       : {0}" -f $Data.VPN_TunnelIP)) }
+    if ($Data.VPN_Detail) { $L.Add(("  VPN Detail      : {0}" -f $Data.VPN_Detail)) }
+    if ($Data.Network.Adapters -and $Data.Network.Adapters.Count -gt 0) {
+        foreach ($adapter in $Data.Network.Adapters) {
+            $L.Add(("  Adapter       : {0}" -f $adapter))
+        }
+    }
+    if ($Data.Network.Gateway) { $L.Add(("  Gateway       : {0}" -f $Data.Network.Gateway)) }
+    if ($Data.Network.DNS -and $Data.Network.DNS.Count -gt 0) {
+        $L.Add(("  DNS Servers   : {0}" -f ($Data.Network.DNS -join ', ')))
+    }
+    if ($Data.Network.WifiSSID) {
+        $L.Add(("  Wi-Fi         : {0} ({1}% signal)" -f $Data.Network.WifiSSID, $Data.Network.WifiSignalPct))
+    }
+    if ($Data.Proxy_WinHTTP) { $L.Add(("  Proxy (WinHTTP): {0}" -f $Data.Proxy_WinHTTP)) }
+    if ($Data.Proxy_IE) { $L.Add(("  Proxy (IE)    : {0}" -f $Data.Proxy_IE)) }
+    $L.Add('')
+
+    # ---- Latency / quality ----
+    $L.Add('LATENCY')
+    if ($Data.Latency.Gateway) {
+        $L.Add(("  Gateway ({0}) : {1}" -f $Data.Latency.Gateway.Target, (Format-PingStat $Data.Latency.Gateway)))
+    }
+    else {
+        $L.Add('  Gateway       : n/a')
+    }
+    if ($Data.Latency.DNS) {
+        $L.Add(("  DNS ({0})     : {1}" -f $Data.Latency.DNS.Target, (Format-PingStat $Data.Latency.DNS)))
+    }
+    else {
+        $L.Add('  DNS           : n/a')
+    }
+    if ($null -ne $Data.Latency.DNS_ResolveMs) {
+        $L.Add(("  DNS resolve   : {0} ms" -f $Data.Latency.DNS_ResolveMs))
+    }
+    $L.Add('')
+
+    # ---- Core infrastructure ----
+    $L.Add('CORE INFRASTRUCTURE')
+    if ($Data.CoreInfrastructure -and $Data.CoreInfrastructure.Count -gt 0) {
+        foreach ($item in $Data.CoreInfrastructure) {
+            if ($item.Success) {
+                $L.Add(("  [OK]   {0} ({1}:{2}) - {3} ms" -f $item.Name, $item.Host, $item.Port, $item.LatencyMs))
+            }
+            else {
+                $L.Add(("  [FAIL] {0} ({1}:{2}) - {3}" -f $item.Name, $item.Host, $item.Port, $item.Error))
+            }
+        }
+    }
+    else {
+        $L.Add('  (no core infrastructure results)')
+    }
+    $L.Add('')
+
+    # ---- Single-target diagnostic ----
+    $L.Add('TARGET DIAGNOSTIC')
+    if ($Data.Target -and $Data.Target.Destination) {
+        $L.Add(("  Target        : {0}" -f $Data.Target.Destination))
+        if ($Data.Target.DNS_Resolved) { $L.Add(("  DNS resolved  : {0}" -f $Data.Target.DNS_Resolved)) }
+        if ($Data.Target.Ping) {
+            $L.Add(("  Ping          : {0}" -f (Format-PingStat $Data.Target.Ping)))
+        }
+        if ($Data.Target.Ports -and $Data.Target.Ports.Count -gt 0) {
+            foreach ($portResult in $Data.Target.Ports) {
+                if ($portResult.Success) {
+                    $L.Add(("  Port {0}       : open ({1} ms)" -f $portResult.Port, $portResult.LatencyMs))
+                }
+                else {
+                    $L.Add(("  Port {0}       : failed - {1}" -f $portResult.Port, $portResult.Error))
+                }
+            }
+        }
+    }
+    else {
+        $L.Add('  (no target destination supplied)')
+    }
+    $L.Add('')
+
+    # ---- Egress ----
+    $L.Add('EGRESS')
+    if ($Data.ExternalIP) {
+        $L.Add(("  External IP   : {0}" -f $Data.ExternalIP))
+    }
+    else {
+        $L.Add('  External IP   : n/a (skipped or lookup failed)')
+    }
+    $L.Add('')
+
+    if ($JsonPath) {
+        $L.Add(("Full JSON : {0}" -f $JsonPath))
+    }
+
+    return ($L -join "`r`n")
+}
+
+# ==========================================================================
+# RECONSTRUCTED in v2 - not present in the truncated repo original
+# Interactive dashboard. This is the color-coded console view described in
+# the README / help. It prints only to the console (Write-Host); Quiet mode
+# never calls it, so a Quiet pipeline stays clean for clipboard use.
+# ==========================================================================
+function Show-Dashboard {
+    param($Data, $FindingsList)
+
+    Write-Host ''
+    Write-Host '============================================================' -ForegroundColor Cyan
+    Write-Host ("  NETWORK & SYSTEM TRIAGE  -  {0}" -f $Data.System.Hostname) -ForegroundColor Cyan
+    Write-Host '============================================================' -ForegroundColor Cyan
+    Write-Host ''
+
+    Write-Host 'KEY FINDINGS' -ForegroundColor White
+    if (-not $FindingsList -or $FindingsList.Count -eq 0) {
+        Write-Host '  - None. All checked metrics are within normal thresholds.' -ForegroundColor Green
+    }
+    else {
+        foreach ($finding in ($FindingsList | Sort-Object @{ E = { Get-SeverityRank $_.Severity } })) {
+            $color = Get-SeverityColor $finding.Severity
+            Write-Host ("  - [{0}] {1}" -f $finding.Severity.ToUpper(), $finding.Message) -ForegroundColor $color
+        }
+    }
+    Write-Host ''
+
+    Write-Host 'SYSTEM' -ForegroundColor White
+    Write-Field 'Logged-on User' $Data.System.LoggedOnUser
+    Write-Field 'Computer' ("{0} ({1})" -f $Data.System.Hostname, $Data.System.Model)
+    Write-Field 'OS' ("{0} (build {1})" -f $Data.System.OS, $Data.System.OSBuild)
+    $uptimeSev = Get-Severity -Value $Data.System.Uptime_Days -Warn $Thresholds.UptimeDays.Warn -Crit $Thresholds.UptimeDays.Crit
+    Write-Field 'Uptime' ("{0} days" -f $Data.System.Uptime_Days) (Get-SeverityColor $uptimeSev)
+    $rebootText = 'No'
+    if ($Data.System.PendingReboot) { $rebootText = "Yes - $($Data.System.RebootReasons)" }
+    $rebootColor = [ConsoleColor]::Green
+    if ($Data.System.PendingReboot) { $rebootColor = [ConsoleColor]::Yellow }
+    Write-Field 'Pending Reboot' $rebootText $rebootColor
+    Write-Host ''
+
+    $perf = $Data.Performance
+    Write-Host 'PERFORMANCE' -ForegroundColor White
+    Write-Field 'CPU Load' ("{0}%" -f $perf.CPU_LoadPct) (Get-MetricColor -Value $perf.CPU_LoadPct -Warn $Thresholds.CpuPct.Warn -Crit $Thresholds.CpuPct.Crit)
+    Write-Field 'Memory' ("{0}% used ({1} GB free of {2} GB)" -f $perf.Memory_UsedPct, $perf.Memory_FreeGB, $perf.Memory_TotalGB) (Get-MetricColor -Value $perf.Memory_UsedPct -Warn $Thresholds.MemPct.Warn -Crit $Thresholds.MemPct.Crit)
+    Write-Field ("Disk {0}" -f $perf.Disk) ("{0}% free ({1} GB free of {2} GB)" -f $perf.Disk_FreePct, $perf.Disk_FreeGB, $perf.Disk_SizeGB) (Get-MetricColor -Value $perf.Disk_FreePct -Warn $Thresholds.DiskFreePct.Warn -Crit $Thresholds.DiskFreePct.Crit -LowerIsWorse)
+    if ($null -ne $perf.Disk_LatencyMs) {
+        Write-Field 'Disk Latency' ("{0} ms avg (queue {1})" -f $perf.Disk_LatencyMs, $perf.Disk_QueueLength) (Get-MetricColor -Value $perf.Disk_LatencyMs -Warn $Thresholds.DiskLatencyMs.Warn -Crit $Thresholds.DiskLatencyMs.Crit)
+    }
+    if ($perf.TopCPU.Count -gt 0) { Write-Field 'Top CPU' ($perf.TopCPU -join ', ') }
+    if ($perf.TopMemory.Count -gt 0) { Write-Field 'Top Memory' ($perf.TopMemory -join ', ') }
+    Write-Host ''
+
+    Write-Host 'NETWORK' -ForegroundColor White
+    Write-Field 'VPN' $Data.VPN_Status
+    if ($Data.Zscaler_State) { Write-Field 'Zscaler' $Data.Zscaler_State }
+    if ($Data.VPN_TunnelIP) { Write-Field 'Tunnel IP' $Data.VPN_TunnelIP }
+    if ($Data.Network.Adapters -and $Data.Network.Adapters.Count -gt 0) {
+        foreach ($adapter in $Data.Network.Adapters) { Write-Field 'Adapter' $adapter }
+    }
+    if ($Data.Network.Gateway) { Write-Field 'Gateway' $Data.Network.Gateway }
+    if ($Data.Network.DNS -and $Data.Network.DNS.Count -gt 0) { Write-Field 'DNS Servers' ($Data.Network.DNS -join ', ') }
+    if ($Data.Network.WifiSSID) {
+        if ($null -ne $Data.Network.WifiSignalPct) {
+            $wifiColor = Get-MetricColor -Value $Data.Network.WifiSignalPct -Warn $Thresholds.WifiPct.Warn -Crit $Thresholds.WifiPct.Crit -LowerIsWorse
+            Write-Field 'Wi-Fi' ("{0} ({1}%)" -f $Data.Network.WifiSSID, $Data.Network.WifiSignalPct) $wifiColor
+        }
+        else {
+            Write-Field 'Wi-Fi' $Data.Network.WifiSSID
+        }
+    }
+    if ($Data.Proxy_WinHTTP) { Write-Field 'Proxy (WinHTTP)' $Data.Proxy_WinHTTP }
+    if ($Data.Proxy_IE) { Write-Field 'Proxy (IE)' $Data.Proxy_IE }
+    Write-Host ''
+
+    Write-Host 'LATENCY' -ForegroundColor White
+    if ($Data.Latency.Gateway) {
+        Write-Field ("Gateway ({0})" -f $Data.Latency.Gateway.Target) (Format-PingStat $Data.Latency.Gateway)
+    }
+    if ($Data.Latency.DNS) {
+        Write-Field ("DNS ({0})" -f $Data.Latency.DNS.Target) (Format-PingStat $Data.Latency.DNS)
+    }
+    if ($null -ne $Data.Latency.DNS_ResolveMs) {
+        Write-Field 'DNS resolve' ("{0} ms" -f $Data.Latency.DNS_ResolveMs) (Get-MetricColor -Value $Data.Latency.DNS_ResolveMs -Warn $Thresholds.DnsMs.Warn -Crit $Thresholds.DnsMs.Crit)
+    }
+    Write-Host ''
+
+    Write-Host 'CORE INFRASTRUCTURE' -ForegroundColor White
+    if ($Data.CoreInfrastructure -and $Data.CoreInfrastructure.Count -gt 0) {
+        foreach ($item in $Data.CoreInfrastructure) {
+            $color = [ConsoleColor]::Green
+            $statusText = 'OK'
+            if (-not $item.Success) { $color = [ConsoleColor]::Red; $statusText = 'FAIL' }
+            $detail = $item.Error
+            if ($item.Success) { $detail = ("{0} ms" -f $item.LatencyMs) }
+            Write-Field $item.Name ("{0}:{1} - {2} ({3})" -f $item.Host, $item.Port, $statusText, $detail) $color
+        }
+    }
+    Write-Host ''
+
+    if ($Data.Target -and $Data.Target.Destination) {
+        Write-Host 'TARGET DIAGNOSTIC' -ForegroundColor White
+        Write-Field 'Target' $Data.Target.Destination
+        if ($Data.Target.DNS_Resolved) { Write-Field 'DNS resolved' $Data.Target.DNS_Resolved }
+        if ($Data.Target.Ping) { Write-Field 'Ping' (Format-PingStat $Data.Target.Ping) }
+        if ($Data.Target.Ports -and $Data.Target.Ports.Count -gt 0) {
+            foreach ($portResult in $Data.Target.Ports) {
+                $color = [ConsoleColor]::Green
+                $detail = ("open ({0} ms)" -f $portResult.LatencyMs)
+                if (-not $portResult.Success) { $color = [ConsoleColor]::Red; $detail = ("failed - {0}" -f $portResult.Error) }
+                Write-Field ("Port {0}" -f $portResult.Port) $detail $color
+            }
+        }
+        Write-Host ''
+    }
+
+    Write-Host 'EGRESS' -ForegroundColor White
+    if ($Data.ExternalIP) { Write-Field 'External IP' $Data.ExternalIP } else { Write-Field 'External IP' 'n/a' }
+    Write-Host ''
+}
+
+# ==========================================================================
+# RECONSTRUCTED in v2 - MAIN FLOW
+# Not present in the truncated repo original. The original ends inside
+# Build-ServiceNowSummary, so there is no $Data population, dashboard call,
+# export, or pruning in the repo file at all. This flow populates $Data
+# using only the helpers already in the file, plus standard CIM / network
+# cmdlets, in the same field names the summary above already expects.
+# READ-ONLY: no step here changes configuration, clears caches, or
+# restarts anything. Export pruning only deletes this script's own old
+# Triage_*.json/.txt pairs, as documented.
+# ==========================================================================
+
+# Prompt for a target only when interactive. Quiet / redirected runs must
+# not hang on Read-Host, so they simply skip the target diagnostic.
+if ([string]::IsNullOrWhiteSpace($TargetDestination)) {
+    $isInteractive = $true
+    try {
+        if ([Console]::IsInputRedirected) { $isInteractive = $false }
+    }
+    catch { }
+    if ($isInteractive -and -not $Quiet) {
+        $prompted = Read-Host 'Target hostname/IP to diagnose (press Enter to skip)'
+        if (-not [string]::IsNullOrWhiteSpace($prompted)) { $TargetDestination = $prompted.Trim() }
+    }
+}
+
+$Data = [ordered]@{
+    CollectedUtc = (Get-Date).ToUniversalTime().ToString('o')
+    Computer     = $env:COMPUTERNAME
+    System       = [ordered]@{
+        LoggedOnUser  = $env:USERNAME
+        Hostname      = $env:COMPUTERNAME
+        Model         = $null
+        OS            = $null
+        OSBuild       = $null
+        Uptime_Days   = 0
+        PendingReboot = $false
+        RebootReasons = ''
+    }
+    Performance  = [ordered]@{
+        CPU_LoadPct    = 0
+        Memory_UsedPct = 0
+        Memory_FreeGB  = 0
+        Memory_TotalGB = 0
+        Disk           = 'C:'
+        Disk_FreePct   = 0
+        Disk_FreeGB    = 0
+        Disk_SizeGB    = 0
+        Disk_LatencyMs = $null
+        Disk_QueueLength = $null
+        TopCPU         = @()
+        TopMemory      = @()
+    }
+    Network      = [ordered]@{
+        Adapters     = @()
+        Gateway      = $null
+        DNS          = @()
+        WifiSSID     = $null
+        WifiSignalPct = $null
+    }
+    VPN_Status   = 'Not detected'
+    Zscaler_State = 'Not detected'
+    VPN_TunnelIP = $null
+    VPN_Detail   = $null
+    Proxy_WinHTTP = $null
+    Proxy_IE     = $null
+    Latency      = [ordered]@{
+        Gateway        = $null
+        DNS            = $null
+        DNS_ResolveMs  = $null
+    }
+    CoreInfrastructure = @()
+    Target       = $null
+    ExternalIP   = $null
+}
+
+# ---- System baseline ----
+try {
+    $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    $csInfo = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+    $Data.System.OS = $osInfo.Caption
+    $Data.System.OSBuild = $osInfo.BuildNumber
+    $Data.System.Model = $csInfo.Model
+    if ($csInfo.UserName) { $Data.System.LoggedOnUser = $csInfo.UserName }
+    if ($osInfo.LastBootUpTime) {
+        $Data.System.Uptime_Days = [math]::Round(((Get-Date) - $osInfo.LastBootUpTime).TotalDays, 1)
+    }
+    $pending = Get-PendingReboot
+    $Data.System.PendingReboot = $pending.Pending
+    $Data.System.RebootReasons = $pending.Reasons
+}
+catch {
+    Write-Warning "System baseline collection failed: $($_.Exception.Message)"
+}
+
+# ---- Performance snapshot ----
+try {
+    $processors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
+    if ($processors.Count -gt 0) {
+        $loadValues = @($processors | Where-Object { $null -ne $_.LoadPercentage } | ForEach-Object { $_.LoadPercentage })
+        if ($loadValues.Count -gt 0) {
+            $Data.Performance.CPU_LoadPct = [math]::Round(($loadValues | Measure-Object -Average).Average, 0)
+        }
+    }
+}
+catch { Write-Warning "CPU load collection failed: $($_.Exception.Message)" }
+
+try {
+    $osMem = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    if ($osMem.TotalVisibleMemorySize -gt 0) {
+        $totalGB = [math]::Round($osMem.TotalVisibleMemorySize / 1MB, 1)
+        $freeGB = [math]::Round($osMem.FreePhysicalMemory / 1MB, 1)
+        $Data.Performance.Memory_TotalGB = $totalGB
+        $Data.Performance.Memory_FreeGB = $freeGB
+        $Data.Performance.Memory_UsedPct = [math]::Round((($totalGB - $freeGB) / $totalGB) * 100, 0)
+    }
+}
+catch { Write-Warning "Memory collection failed: $($_.Exception.Message)" }
+
+try {
+    $systemDrive = 'C:'
+    if ($env:SystemDrive) { $systemDrive = $env:SystemDrive }
+    $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $systemDrive) -ErrorAction Stop
+    if ($disk -and $disk.Size -gt 0) {
+        $Data.Performance.Disk = $systemDrive
+        $Data.Performance.Disk_SizeGB = [math]::Round($disk.Size / 1GB, 1)
+        $Data.Performance.Disk_FreeGB = [math]::Round($disk.FreeSpace / 1GB, 1)
+        $Data.Performance.Disk_FreePct = [math]::Round(($disk.FreeSpace / $disk.Size) * 100, 0)
+    }
+    $diskLatency = Get-DiskLatency
+    if ($diskLatency) {
+        $Data.Performance.Disk_LatencyMs = $diskLatency.AvgLatencyMs
+        $Data.Performance.Disk_QueueLength = $diskLatency.QueueLength
+    }
+}
+catch { Write-Warning "Disk collection failed: $($_.Exception.Message)" }
+
+try {
+    $logicalProcessors = 1
+    try {
+        $cpuCount = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
+        if ($cpuCount.Count -gt 0) { $logicalProcessors = 0 }
+        foreach ($cpu in $cpuCount) { $logicalProcessors += $cpu.NumberOfLogicalProcessors }
+        if ($logicalProcessors -le 0) { $logicalProcessors = 1 }
+    }
+    catch { $logicalProcessors = 1 }
+    $topCpu = Get-TopCpuProcesses -Top 3 -LogicalProcessors $logicalProcessors
+    $Data.Performance.TopCPU = @($topCpu | ForEach-Object { "{0} ({1}%)" -f $_.Name, $_.PctCpu })
+}
+catch { $Data.Performance.TopCPU = @() }
+
+try {
+    $topMem = @(Get-Process -ErrorAction Stop | Sort-Object WorkingSet64 -Descending | Select-Object -First 3)
+    $Data.Performance.TopMemory = @($topMem | ForEach-Object { "{0} ({1:N1} GB)" -f $_.ProcessName, ($_.WorkingSet64 / 1GB) })
+}
+catch { $Data.Performance.TopMemory = @() }
+
+# ---- Network config ----
+try {
+    $adapters = @()
+    $gateways = @()
+    $dnsServers = @()
+    $netConfigs = @(Get-NetIPConfiguration -ErrorAction Stop)
+    foreach ($config in $netConfigs) {
+        $ipv4 = $null
+        $ipv6 = $null
+        if ($config.IPv4Address) { $ipv4 = $config.IPv4Address.IPAddress }
+        if ($config.IPv6Address) { $ipv6 = $config.IPv6Address.IPAddress }
+        $adapterText = $config.InterfaceAlias
+        if ($ipv4) { $adapterText = "{0}: {1}" -f $adapterText, $ipv4 }
+        if ($ipv6) { $adapterText = "{0} / {1}" -f $adapterText, $ipv6 }
+        $adapters += $adapterText
+        if ($config.IPv4DefaultGateway) { $gateways += $config.IPv4DefaultGateway.NextHop }
+        if ($config.DNSServer) {
+            foreach ($dns in $config.DNSServer) {
+                if ($dns.ServerAddresses) { $dnsServers += $dns.ServerAddresses }
+            }
+        }
+    }
+    if ($adapters.Count -eq 0) { throw 'Get-NetIPConfiguration returned no adapters' }
+    $Data.Network.Adapters = $adapters
+    if ($gateways.Count -gt 0) { $Data.Network.Gateway = $gateways[0] }
+    $Data.Network.DNS = @($dnsServers | Select-Object -Unique)
+}
+catch {
+    # Fallback: CIM adapter configuration, for hosts without the NetTCPIP module.
+    try {
+        $cimAdapters = @(Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' -ErrorAction Stop)
+        $adapters = @()
+        $gateways = @()
+        $dnsServers = @()
+        foreach ($cim in $cimAdapters) {
+            $ipText = ''
+            if ($cim.IPAddress) { $ipText = ($cim.IPAddress -join ', ') }
+            $adapters += ("{0}: {1}" -f $cim.Description, $ipText)
+            if ($cim.DefaultIPGateway) { $gateways += $cim.DefaultIPGateway }
+            if ($cim.DNSServerSearchOrder) { $dnsServers += $cim.DNSServerSearchOrder }
+        }
+        $Data.Network.Adapters = $adapters
+        if ($gateways.Count -gt 0) { $Data.Network.Gateway = $gateways[0] }
+        $Data.Network.DNS = @($dnsServers | Select-Object -Unique)
+    }
+    catch {
+        Write-Warning "Network config collection failed: $($_.Exception.Message)"
+    }
+}
+
+try {
+    $wifi = Get-WifiInfo
+    if ($wifi) {
+        $Data.Network.WifiSSID = $wifi.SSID
+        $Data.Network.WifiSignalPct = $wifi.SignalPct
+    }
+}
+catch { }
+
+# ---- VPN detection (Cisco Secure Client + Zscaler, via processes/services) ----
+try {
+    $ciscoRunning = $false
+    $zscalerRunning = $false
+    $ciscoSvc = @(Get-Service -Name 'vpnagent' -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' })
+    if ($ciscoSvc.Count -gt 0) { $ciscoRunning = $true }
+    $zscalerSvc = @(Get-Service -Name 'ZSATunnel', 'ZSAService' -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' })
+    if ($zscalerSvc.Count -gt 0) { $zscalerRunning = $true }
+    $vpnProcs = @(Get-Process -Name 'vpnui', 'vpnagent', 'ZSATunnel', 'ZSAService' -ErrorAction SilentlyContinue)
+    foreach ($proc in $vpnProcs) {
+        if ($proc.ProcessName -match 'vpn') { $ciscoRunning = $true }
+        if ($proc.ProcessName -match 'ZSA') { $zscalerRunning = $true }
+    }
+    if ($zscalerRunning) { $Data.Zscaler_State = 'Running' } else { $Data.Zscaler_State = 'Not detected' }
+
+    $tunnelIP = $null
+    $tunnelDetail = $null
+    try {
+        $tunnelAdapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.InterfaceDescription -match 'Cisco|Zscaler|VPN|Tunnel' -and $_.Status -eq 'Up' })
+        foreach ($tunnel in $tunnelAdapters) {
+            $tunnelAddresses = @(Get-NetIPAddress -InterfaceIndex $tunnel.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+            if ($tunnelAddresses.Count -gt 0) {
+                $tunnelIP = $tunnelAddresses[0].IPAddress
+                $tunnelDetail = $tunnel.InterfaceDescription
+                break
+            }
+        }
+    }
+    catch { }
+    $Data.VPN_TunnelIP = $tunnelIP
+    $Data.VPN_Detail = $tunnelDetail
+
+    if ($ciscoRunning -and $zscalerRunning) { $Data.VPN_Status = 'Connected - Cisco Secure Client + Zscaler' }
+    elseif ($ciscoRunning) { $Data.VPN_Status = 'Connected - Cisco Secure Client' }
+    elseif ($zscalerRunning) { $Data.VPN_Status = 'Connected - Zscaler' }
+    elseif ($tunnelIP) { $Data.VPN_Status = 'Tunnel adapter detected (client not identified)' }
+    else { $Data.VPN_Status = 'Not connected' }
+}
+catch {
+    Write-Warning "VPN detection failed: $($_.Exception.Message)"
+}
+
+# ---- Proxy ----
+try {
+    $proxy = Get-ProxyConfig -UserName $Data.System.LoggedOnUser
+    $Data.Proxy_WinHTTP = $proxy.WinHTTP
+    $Data.Proxy_IE = $proxy.IE
+}
+catch { }
+
+# ---- Latency / quality ----
+if ($Data.Network.Gateway) {
+    $Data.Latency.Gateway = Get-PingStats -ComputerName $Data.Network.Gateway -Count $PingCount -TimeoutMs $PingTimeoutMs
+}
+if ($Data.Network.DNS -and $Data.Network.DNS.Count -gt 0) {
+    $Data.Latency.DNS = Get-PingStats -ComputerName $Data.Network.DNS[0] -Count $PingCount -TimeoutMs $PingTimeoutMs
+}
+try {
+    $dnsStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $dnsCmd = Get-Command -Name 'Resolve-DnsName' -ErrorAction SilentlyContinue
+    if ($dnsCmd) {
+        $null = Resolve-DnsName -Name 'www.microsoft.com' -Type A -ErrorAction Stop
+    }
+    else {
+        $null = [System.Net.Dns]::GetHostAddresses('www.microsoft.com')
+    }
+    $dnsStopwatch.Stop()
+    $Data.Latency.DNS_ResolveMs = [math]::Round($dnsStopwatch.Elapsed.TotalMilliseconds, 0)
+}
+catch {
+    $Data.Latency.DNS_ResolveMs = $null
+}
+
+# ---- Core infrastructure reachability ----
+$coreResults = @()
+foreach ($targetItem in $CoreInfrastructure) {
+    $tcpResult = Test-TcpPort -ComputerName $targetItem.Host -Port ([int]$targetItem.Port) -TimeoutMs $TcpTimeoutMs
+    $coreResults += [ordered]@{
+        Name = $targetItem.Name
+        Host = $targetItem.Host
+        Port = [int]$targetItem.Port
+        Success = $tcpResult.Success
+        LatencyMs = $tcpResult.LatencyMs
+        Error = $tcpResult.Error
+    }
+}
+$Data.CoreInfrastructure = $coreResults
+
+# ---- Single-target diagnostic ----
+if (-not [string]::IsNullOrWhiteSpace($TargetDestination)) {
+    $targetData = [ordered]@{
+        Destination = $TargetDestination
+        DNS_Resolved = $null
+        Ping = $null
+        Ports = @()
+    }
+    $isIP = $false
+    $ipAddress = $null
+    if ([System.Net.IPAddress]::TryParse($TargetDestination, [ref]$ipAddress)) { $isIP = $true }
+    if ($isIP) {
+        $targetData.DNS_Resolved = $TargetDestination
+    }
+    else {
+        try {
+            $dnsCmd = Get-Command -Name 'Resolve-DnsName' -ErrorAction SilentlyContinue
+            if ($dnsCmd) {
+                $resolved = Resolve-DnsName -Name $TargetDestination -Type A -ErrorAction Stop | Select-Object -First 1
+                if ($resolved -and $resolved.IPAddress) { $targetData.DNS_Resolved = $resolved.IPAddress }
+            }
+            else {
+                $addresses = [System.Net.Dns]::GetHostAddresses($TargetDestination)
+                if ($addresses -and $addresses.Count -gt 0) { $targetData.DNS_Resolved = $addresses[0].ToString() }
+            }
+        }
+        catch {
+            $targetData.DNS_Resolved = $null
+        }
+    }
+    $targetData.Ping = Get-PingStats -ComputerName $TargetDestination -Count $PingCount -TimeoutMs $PingTimeoutMs
+    $portResults = @()
+    foreach ($port in $TargetPorts) {
+        $tcpResult = Test-TcpPort -ComputerName $TargetDestination -Port ([int]$port) -TimeoutMs $TcpTimeoutMs
+        $portResults += [ordered]@{
+            Port = [int]$port
+            Success = $tcpResult.Success
+            LatencyMs = $tcpResult.LatencyMs
+            Error = $tcpResult.Error
+        }
+    }
+    $targetData.Ports = $portResults
+    $Data.Target = $targetData
+}
+
+# ---- Egress IP ----
+if (-not $SkipExternalIP) {
+    try {
+        $egress = Invoke-RestMethod -Uri 'https://ifconfig.me/ip' -TimeoutSec 5 -ErrorAction Stop
+        $Data.ExternalIP = "$egress".Trim()
+    }
+    catch {
+        try {
+            $egress = Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 5 -ErrorAction Stop
+            $Data.ExternalIP = "$egress".Trim()
+        }
+        catch {
+            $Data.ExternalIP = $null
+        }
+    }
+}
+
+# ---- Findings analysis (thresholds + failures) ----
+# RECONSTRUCTED in v2: the original populates $Findings in collectors, but
+# no analysis pass survives in the truncated file. This pass uses only the
+# thresholds already defined at the top of the original.
+if ($Data.System.PendingReboot) {
+    Add-Finding 'Warn' ("Pending reboot - {0}" -f $Data.System.RebootReasons)
+}
+if ($Data.System.Uptime_Days -ge $Thresholds.UptimeDays.Crit) {
+    Add-Finding 'Crit' ("Uptime {0} days - consider reboot" -f $Data.System.Uptime_Days)
+}
+elseif ($Data.System.Uptime_Days -ge $Thresholds.UptimeDays.Warn) {
+    Add-Finding 'Warn' ("Uptime {0} days - consider reboot" -f $Data.System.Uptime_Days)
+}
+if ($Data.Performance.CPU_LoadPct -ge $Thresholds.CpuPct.Crit) {
+    Add-Finding 'Crit' ("CPU load {0}% is critically high" -f $Data.Performance.CPU_LoadPct)
+}
+elseif ($Data.Performance.CPU_LoadPct -ge $Thresholds.CpuPct.Warn) {
+    Add-Finding 'Warn' ("CPU load {0}% is high" -f $Data.Performance.CPU_LoadPct)
+}
+if ($Data.Performance.Memory_UsedPct -ge $Thresholds.MemPct.Crit) {
+    Add-Finding 'Crit' ("Memory {0}% used" -f $Data.Performance.Memory_UsedPct)
+}
+elseif ($Data.Performance.Memory_UsedPct -ge $Thresholds.MemPct.Warn) {
+    Add-Finding 'Warn' ("Memory {0}% used" -f $Data.Performance.Memory_UsedPct)
+}
+if ($Data.Performance.Disk_FreePct -le $Thresholds.DiskFreePct.Crit -and $Data.Performance.Disk_SizeGB -gt 0) {
+    Add-Finding 'Crit' ("Disk {0} only {1}% free" -f $Data.Performance.Disk, $Data.Performance.Disk_FreePct)
+}
+elseif ($Data.Performance.Disk_FreePct -le $Thresholds.DiskFreePct.Warn -and $Data.Performance.Disk_SizeGB -gt 0) {
+    Add-Finding 'Warn' ("Disk {0} only {1}% free" -f $Data.Performance.Disk, $Data.Performance.Disk_FreePct)
+}
+if ($null -ne $Data.Performance.Disk_LatencyMs -and $Data.Performance.Disk_LatencyMs -ge $Thresholds.DiskLatencyMs.Crit) {
+    Add-Finding 'Crit' ("Disk latency {0} ms avg is critically high" -f $Data.Performance.Disk_LatencyMs)
+}
+elseif ($null -ne $Data.Performance.Disk_LatencyMs -and $Data.Performance.Disk_LatencyMs -ge $Thresholds.DiskLatencyMs.Warn) {
+    Add-Finding 'Warn' ("Disk latency {0} ms avg is high" -f $Data.Performance.Disk_LatencyMs)
+}
+if ($null -ne $Data.Network.WifiSignalPct) {
+    if ($Data.Network.WifiSignalPct -le $Thresholds.WifiPct.Crit) {
+        Add-Finding 'Crit' ("Weak Wi-Fi signal {0}% on '{1}'" -f $Data.Network.WifiSignalPct, $Data.Network.WifiSSID)
+    }
+    elseif ($Data.Network.WifiSignalPct -le $Thresholds.WifiPct.Warn) {
+        Add-Finding 'Warn' ("Weak Wi-Fi signal {0}% on '{1}'" -f $Data.Network.WifiSignalPct, $Data.Network.WifiSSID)
+    }
+}
+if ($Data.Latency.Gateway -and $null -ne $Data.Latency.Gateway.AvgMs) {
+    if ($Data.Latency.Gateway.AvgMs -ge $Thresholds.GwRttMs.Crit) {
+        Add-Finding 'Crit' ("Gateway latency {0} ms avg is critically high" -f $Data.Latency.Gateway.AvgMs)
+    }
+    elseif ($Data.Latency.Gateway.AvgMs -ge $Thresholds.GwRttMs.Warn) {
+        Add-Finding 'Warn' ("Gateway latency {0} ms avg is high" -f $Data.Latency.Gateway.AvgMs)
+    }
+    if ($Data.Latency.Gateway.LossPct -ge $Thresholds.LossPct.Crit) {
+        Add-Finding 'Crit' ("Gateway packet loss {0}%" -f $Data.Latency.Gateway.LossPct)
+    }
+    elseif ($Data.Latency.Gateway.LossPct -ge $Thresholds.LossPct.Warn) {
+        Add-Finding 'Warn' ("Gateway packet loss {0}%" -f $Data.Latency.Gateway.LossPct)
+    }
+}
+if ($null -ne $Data.Latency.DNS_ResolveMs) {
+    if ($Data.Latency.DNS_ResolveMs -ge $Thresholds.DnsMs.Crit) {
+        Add-Finding 'Crit' ("DNS resolve time {0} ms is critically slow" -f $Data.Latency.DNS_ResolveMs)
+    }
+    elseif ($Data.Latency.DNS_ResolveMs -ge $Thresholds.DnsMs.Warn) {
+        Add-Finding 'Warn' ("DNS resolve time {0} ms is slow" -f $Data.Latency.DNS_ResolveMs)
+    }
+}
+foreach ($item in $Data.CoreInfrastructure) {
+    if (-not $item.Success) {
+        Add-Finding 'Fail' ("Cannot reach {0} ({1}:{2})" -f $item.Name, $item.Host, $item.Port)
+    }
+}
+if ($Data.Target -and $Data.Target.Ports) {
+    foreach ($portResult in $Data.Target.Ports) {
+        if (-not $portResult.Success) {
+            Add-Finding 'Fail' ("Target {0}:{1} unreachable - {2}" -f $Data.Target.Destination, $portResult.Port, $portResult.Error)
+        }
+    }
+    if ($Data.Target.Ping -and $Data.Target.Ping.Received -eq 0) {
+        Add-Finding 'Fail' ("Target {0} did not respond to ping (100% loss)" -f $Data.Target.Destination)
+    }
+}
+
+# ---- Export (JSON + plain-text summary), then prune old exports ----
+# RECONSTRUCTED in v2. ExportPath is a file path, not a folder, so the
+# .txt summary sits alongside it and pruning uses its folder.
+$exportDirectory = $null
+$txtPath = $null
+$exportSucceeded = $false
+try {
+    $exportDirectory = Split-Path -Parent $ExportPath
+    if ([string]::IsNullOrWhiteSpace($exportDirectory)) { $exportDirectory = Get-Location }
+    if (-not (Test-Path -LiteralPath $exportDirectory)) {
+        New-Item -ItemType Directory -Path $exportDirectory -Force | Out-Null
+    }
+    $txtPath = [System.IO.Path]::ChangeExtension($ExportPath, 'txt')
+    $summaryText = Build-ServiceNowSummary -Data $Data -FindingsList $Findings -JsonPath $ExportPath
+    $Data | ConvertTo-Json -Depth 6 | Set-Content -Path $ExportPath -Encoding UTF8 -Force
+    $summaryText | Set-Content -Path $txtPath -Encoding UTF8 -Force
+    $exportSucceeded = $true
+}
+catch {
+    Write-Warning "Export failed: $($_.Exception.Message)"
+    # Still build the summary for console/clipboard use, without a JSON path.
+    $summaryText = Build-ServiceNowSummary -Data $Data -FindingsList $Findings -JsonPath ''
+}
+
+if ($exportSucceeded -and $exportDirectory) {
+    Remove-OldTriageExports -Directory $exportDirectory -Keep $RetainCount
+}
+
+# ---- Output ----
+if ($Quiet) {
+    # Plain-text summary only. This is the last output, so a pipeline
+    # like '-Quiet | clip' receives only the summary.
+    if ($CopyToClipboard) {
+        try { $summaryText | Set-Clipboard -ErrorAction Stop } catch { Write-Warning "Could not copy summary to clipboard: $($_.Exception.Message)" }
+    }
+    else {
+        # Quiet implies clipboard per the README / help.
+        try { $summaryText | Set-Clipboard -ErrorAction Stop } catch { Write-Warning "Could not copy summary to clipboard: $($_.Exception.Message)" }
+    }
+    Write-Output $summaryText
+}
+else {
+    Show-Dashboard -Data $Data -FindingsList $Findings
+    if ($exportSucceeded) {
+        Write-Host ("JSON export : {0}" -f $ExportPath) -ForegroundColor Gray
+        Write-Host ("Text summary: {0}" -f $txtPath) -ForegroundColor Gray
+    }
+    if ($CopyToClipboard) {
+        try {
+            $summaryText | Set-Clipboard -ErrorAction Stop
+            Write-Host 'Plain-text summary copied to clipboard.' -ForegroundColor Gray
+        }
+        catch {
+            Write-Warning "Could not copy summary to clipboard: $($_.Exception.Message)"
+        }
+    }
+}
