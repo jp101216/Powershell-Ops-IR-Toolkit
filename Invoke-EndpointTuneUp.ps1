@@ -184,10 +184,8 @@
 
 .NOTES
     Must run elevated. The #Requires line enforces this on Windows.
-    This script was reviewed for PowerShell 5.1 / 7.x syntax on Windows.
-    PowerShell is not available on the Linux machine used to prepare v2,
-    so v2 was not executed on Windows here; run a -WhatIf pass first on
-    a test host before a live run.
+    Windows PowerShell 5.1 and PowerShell 7 smoke tests run in GitHub Actions.
+    The Windows 11 job also runs DISM cleanup and SFC on a disposable runner.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]

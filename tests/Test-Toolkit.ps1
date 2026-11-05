@@ -1,11 +1,17 @@
 #Requires -Version 5.1
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([switch]$IncludeWindowsUpdateScan)
+param(
+    [switch]$IncludeWindowsUpdateScan,
+    [switch]$RunMaintenance
+)
 
 $ErrorActionPreference = 'Stop'
 if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
     throw 'This smoke test requires Windows.'
+}
+if ($RunMaintenance -and ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted')) {
+    throw 'Native maintenance tests require a disposable GitHub-hosted runner.'
 }
 
 function Assert-Result {
@@ -48,19 +54,32 @@ try {
     finally { $listener.Stop() }
     Write-Host 'NetTriage loopback and export checks passed.'
 
-    # Guard against a dry-run regression even when the test is run on a workstation.
-    function ipconfig.exe { throw 'Unexpected network step in a cleanup-only run.' }
-    function dism.exe { throw 'Unexpected DISM invocation during WhatIf.' }
-    function sfc.exe { throw 'Unexpected SFC invocation during WhatIf.' }
-    function shutdown.exe { throw 'Unexpected reboot invocation during WhatIf.' }
+    & {
+        # Keep these guards in the dry-run scope.
+        function ipconfig.exe { throw 'Unexpected network step in a cleanup-only run.' }
+        function dism.exe { throw 'Unexpected DISM invocation during WhatIf.' }
+        function sfc.exe { throw 'Unexpected SFC invocation during WhatIf.' }
+        function shutdown.exe { throw 'Unexpected reboot invocation during WhatIf.' }
 
-    $dryRunPath = Join-Path $tempRoot 'TuneUpDryRun'
-    $summary = & (Join-Path $repo 'Invoke-EndpointTuneUp.ps1') -Phase Cleanup -SkipTempCleanup `
-        -DeepClean -Reboot -WhatIf -NonInteractive -Quiet -LogDirectory $dryRunPath
-    Assert-Result (-not (Test-Path -LiteralPath $dryRunPath)) 'Tune-up WhatIf created an audit directory.'
-    Assert-Result ($summary -is [string] -and $summary -match 'Failed steps\s+: none') 'Tune-up WhatIf failed.'
-    Assert-Result ($summary -match 'Skipped steps\s+: .*DISM component-store cleanup.*Reboot \(shutdown /r\)') 'Tune-up WhatIf omitted expected skipped steps.'
+        $dryRunPath = Join-Path $tempRoot 'TuneUpDryRun'
+        $summary = & (Join-Path $repo 'Invoke-EndpointTuneUp.ps1') -Phase Cleanup -SkipTempCleanup `
+            -DeepClean -Reboot -WhatIf -NonInteractive -Quiet -LogDirectory $dryRunPath
+        Assert-Result (-not (Test-Path -LiteralPath $dryRunPath)) 'Tune-up WhatIf created an audit directory.'
+        Assert-Result ($summary -is [string] -and $summary -match 'Failed steps\s+: none') 'Tune-up WhatIf failed.'
+        Assert-Result ($summary -match 'Skipped steps\s+: .*DISM component-store cleanup.*Reboot \(shutdown /r\)') 'Tune-up WhatIf omitted expected skipped steps.'
+    }
     Write-Host 'Endpoint Tune-Up phase selection and dry-run checks passed.'
+
+    if ($RunMaintenance) {
+        $maintenancePath = Join-Path $tempRoot 'Maintenance.json'
+        & (Join-Path $repo 'Invoke-EndpointTuneUp.ps1') -Phase Cleanup -SkipTempCleanup `
+            -DeepClean -NonInteractive -Quiet -LogDirectory $tempRoot -ReportPath $maintenancePath -LogRetentionDays 0
+        $maintenance = Get-Content -LiteralPath $maintenancePath -Raw | ConvertFrom-Json
+        Assert-Result (-not $maintenance.FatalError -and $maintenance.FailedSteps.Count -eq 0) 'Native maintenance reported a failure.'
+        $completed = @($maintenance.Steps | Where-Object { $_.Status -eq 'Success' })
+        Assert-Result ($completed.Count -eq 2 -and @($completed | Where-Object { $_.Phase -ne 'Cleanup' }).Count -eq 0) 'Native maintenance ran unexpected steps.'
+        Write-Host 'Native DISM cleanup and SFC checks passed.'
+    }
 
     if ($IncludeWindowsUpdateScan) {
         $updatePath = Join-Path $tempRoot 'Update[1].json'
@@ -75,7 +94,7 @@ try {
             Write-Warning "The Windows Update source returned a scan failure: $($update.Errors -join ', ')"
         }
         else {
-            Write-Host "Windows Update scan status: $($update.WindowsUpdate.ScanStatus)."
+            Write-Host "Windows Update scan status: $($update.WindowsUpdate.ScanStatus). Applicable updates: $($update.WindowsUpdate.Found)."
         }
     }
 }
