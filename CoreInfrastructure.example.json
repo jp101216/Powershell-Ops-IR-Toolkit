@@ -1,0 +1,4 @@
+[
+  { "Name": "Intranet", "Host": "intranet.example.com", "Port": 443 },
+  { "Name": "File server", "Host": "fileserver.example.com", "Port": 445 }
+]

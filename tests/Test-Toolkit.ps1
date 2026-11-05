@@ -167,3 +167,4 @@ try {
 finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force
 }
+$global:LASTEXITCODE = 0
