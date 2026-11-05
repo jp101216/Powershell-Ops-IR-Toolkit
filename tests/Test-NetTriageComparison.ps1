@@ -135,6 +135,22 @@ try {
 
     $left = Write-Fixture (New-Snapshot $false) 'before.json'
     $right = Write-Fixture (New-Snapshot $true) 'after.json'
+    $unicodeBefore = New-Snapshot $false
+    $unicodeAfter = New-Snapshot $true
+    $unicodeHost = 'LAB-' + [char]0x00C4 + '01'
+    foreach ($snapshot in @($unicodeBefore, $unicodeAfter)) {
+        $snapshot.Computer = $unicodeHost
+        $snapshot.System.Hostname = $unicodeHost
+    }
+    $unicodeLeft = Join-Path $tempRoot 'unicode-before.json'
+    $unicodeRight = Join-Path $tempRoot 'unicode-after.json'
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($unicodeLeft, ($unicodeBefore | ConvertTo-Json -Depth 8), $encoding)
+    [System.IO.File]::WriteAllText($unicodeRight, ($unicodeAfter | ConvertTo-Json -Depth 8), $encoding)
+    $unicodeOutput = Join-Path $tempRoot 'unicode-comparison.json'
+    & $commandPath $unicodeLeft $unicodeRight -ExportPath $unicodeOutput -Quiet | Out-Null
+    $unicodeResult = Get-Content -LiteralPath $unicodeOutput -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Result ($unicodeResult.Computer -ceq $unicodeHost) 'UTF-8 exports without a BOM must preserve computer names across editions.'
     Assert-Rejected { & $commandPath $left $right -ExportPath $left -Quiet } 'new path'
     $existingText = Join-Path $tempRoot 'existing.txt'
     'Keep this text' | Set-Content -LiteralPath $existingText

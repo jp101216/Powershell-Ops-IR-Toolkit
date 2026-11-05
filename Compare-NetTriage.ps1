@@ -74,7 +74,7 @@ function Read-Snapshot {
     if ($file.PSProvider.Name -ne 'FileSystem' -or $file.PSIsContainer -or $file.Length -gt 16MB) {
         throw "Expected a JSON file of at most 16 MB at '$Path'."
     }
-    $json = Get-Content -LiteralPath $file.FullName -Raw
+    $json = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8
     if ([string]::IsNullOrWhiteSpace($json) -or -not $json.TrimStart().StartsWith('{')) {
         throw "Expected a NetTriage JSON object at '$Path'."
     }
