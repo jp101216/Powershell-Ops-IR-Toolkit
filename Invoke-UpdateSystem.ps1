@@ -47,6 +47,15 @@
 .PARAMETER AutoInstall
     Apply Windows Update driver/firmware updates without an interactive prompt.
 
+.PARAMETER ScanOnly
+    Report system identity, available driver/firmware updates, and the OEM
+    recommendation without entering the menu or applying updates. Scans use
+    the configured Windows Update source and write the usual audit report.
+
+.PARAMETER UpdateId
+    Limit the scan or installation to these exact Windows Update identities.
+    Identities are included in each update's JSON report entry.
+
 .PARAMETER IncludeApps
     Also run `winget upgrade --all` for installed applications.
 
@@ -80,18 +89,17 @@
     the transcript, and the JSON report.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\Invoke-UpdateSystem-v2.ps1
+    powershell -File .\Invoke-UpdateSystem.ps1
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\Invoke-UpdateSystem-v2.ps1 -AutoInstall -IncludeApps
+    powershell -File .\Invoke-UpdateSystem.ps1 -AutoInstall -IncludeApps
 
 .EXAMPLE
-    # Scheduled task / automation: scan only, no prompts, JSON report only.
-    powershell -ExecutionPolicy Bypass -File .\Invoke-UpdateSystem-v2.ps1 -NonInteractive -ReportPath C:\Reports\update.json
+    powershell -File .\Invoke-UpdateSystem.ps1 -ScanOnly -ReportPath C:\Reports\update.json
 
 .EXAMPLE
     # Dry run: show what would be installed, change nothing.
-    powershell -ExecutionPolicy Bypass -File .\Invoke-UpdateSystem-v2.ps1 -AutoInstall -WhatIf
+    powershell -File .\Invoke-UpdateSystem.ps1 -AutoInstall -WhatIf
 
 .NOTES
     Must run elevated. The #Requires line enforces this on Windows.
@@ -104,6 +112,9 @@
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [switch]$AutoInstall,
+    [switch]$ScanOnly,
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string[]]$UpdateId,
     [switch]$IncludeApps,
     [switch]$NonInteractive,
     [switch]$Force,
@@ -116,6 +127,10 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ($ScanOnly -and ($AutoInstall -or $IncludeApps -or $AllowReboot)) {
+    throw '-ScanOnly cannot be combined with -AutoInstall, -IncludeApps, or -AllowReboot.'
+}
 
 # Script-level state, initialised up front for Set-StrictMode.
 $script:IsNonInteractive = $false
@@ -229,17 +244,17 @@ function Get-SystemInfo {
     if ($RedactSerial) { $serial = 'REDACTED' }
 
     $info = [pscustomobject]@{
-        Manufacturer = $cs.Manufacturer
-        Model        = $cs.Model
+        Manufacturer = $(if ($null -ne $cs) { $cs.Manufacturer })
+        Model        = $(if ($null -ne $cs) { $cs.Model })
         IsPortable   = ($null -ne $cs -and $cs.PCSystemType -eq 2)
-        Motherboard  = "$($bb.Manufacturer) $($bb.Product)".Trim()
+        Motherboard  = $(if ($null -ne $bb) { "$($bb.Manufacturer) $($bb.Product)".Trim() })
         Serial       = $serial
-        BiosVersion  = $bios.SMBIOSBIOSVersion
+        BiosVersion  = $(if ($null -ne $bios) { $bios.SMBIOSBIOSVersion })
         BiosDate     = $biosDate
-        OS           = $os.Caption
-        OSBuild      = $os.BuildNumber
-        OSVersion    = $os.Version
-        Architecture = $os.OSArchitecture
+        OS           = $(if ($null -ne $os) { $os.Caption })
+        OSBuild      = $(if ($null -ne $os) { $os.BuildNumber })
+        OSVersion    = $(if ($null -ne $os) { $os.Version })
+        Architecture = $(if ($null -ne $os) { $os.OSArchitecture })
     }
 
     $info | Format-List | Out-String | Write-Host
@@ -271,43 +286,26 @@ function Invoke-WindowsUpdateDrivers {
     $searcher = $null
     $downloader = $null
     $installer = $null
+    $toDownload = $null
     $toInstall = $null
     $result = $null
+    $downloadResult = $null
+    $installResult = $null
 
     $summary = [pscustomobject]@{
+        Available      = 0
         Found          = 0
         Titles         = @()
+        ScanStatus     = 'Failed'
+        InstallStatus  = $(if ($Apply) { 'NotStarted' } else { 'NotRequested' })
+        Updates        = @()
         Installed      = $false
         InstallErrors  = @()
         RebootRequired = $false
     }
 
     try {
-        # Keep the update service running; a stopped service is a common
-        # reason a scan silently returns nothing.
-        $service = Get-Service -Name 'wuauserv' -ErrorAction SilentlyContinue
-        if ($null -ne $service -and $service.Status -ne 'Running') {
-            if ($PSCmdlet.ShouldProcess('Windows Update service (wuauserv)', 'Start service')) {
-                try { Start-Service -Name 'wuauserv' -ErrorAction Stop }
-                catch { Write-Warn "Could not start wuauserv: $($_.Exception.Message)" }
-            }
-        }
-
-        # Opt in to the Microsoft Update service for broader driver coverage.
-        try {
-            $serviceManager = New-Object -ComObject 'Microsoft.Update.ServiceManager' -ErrorAction Stop
-            try {
-                $serviceManager.AddService2('7971f918-a847-4430-9279-4a52d1efe18d', 7, '') | Out-Null
-                Write-Info 'Microsoft Update service registered.'
-            }
-            finally {
-                try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($serviceManager) | Out-Null } catch { }
-            }
-        }
-        catch {
-            Write-Warn "Could not register Microsoft Update service: $($_.Exception.Message)"
-        }
-
+        # Let WUA select the configured source and manage its service lifecycle.
         $session = New-Object -ComObject 'Microsoft.Update.Session' -ErrorAction Stop
         $searcher = $session.CreateUpdateSearcher()
 
@@ -316,97 +314,146 @@ function Invoke-WindowsUpdateDrivers {
         # IsHidden=0 keeps hidden / declined updates out of the list.
         $result = $searcher.Search("IsInstalled=0 AND Type='Driver' AND IsHidden=0")
 
-        if ($null -eq $result -or $result.Updates.Count -eq 0) {
-            Write-Good 'No driver/firmware updates available from Windows Update.'
-            return $summary
+        if ($null -eq $result -or $result.ResultCode -notin @(2, 3)) {
+            $resultCode = if ($null -ne $result) { $result.ResultCode } else { 'unavailable' }
+            throw "Windows Update search did not complete (ResultCode $resultCode)."
+        }
+        $summary.ScanStatus = 'Succeeded'
+        if ($result.ResultCode -eq 3) {
+            $summary.ScanStatus = 'Partial'
+            $message = 'Windows Update search returned partial results. Installation skipped.'
+            $summary.InstallErrors += $message
+            Write-Warn $message
         }
 
-        $summary.Found = $result.Updates.Count
-        Write-Warn "$($result.Updates.Count) update(s) found:"
-        foreach ($update in $result.Updates) {
-            $summary.Titles += $update.Title
-            Write-Host "    - $($update.Title)" -ForegroundColor White
+        $summary.Available = $result.Updates.Count
+        $matchedUpdates = @($result.Updates)
+        if ($UpdateId) {
+            $matchedUpdates = @($matchedUpdates | Where-Object { $UpdateId -contains $_.Identity.UpdateID })
+            $matchedIds = @($matchedUpdates | ForEach-Object { $_.Identity.UpdateID })
+            $missingIds = @($UpdateId | Where-Object { $_ -notin $matchedIds })
+            if ($missingIds.Count -gt 0) {
+                throw "Requested update identities were not returned by the search: $($missingIds -join ', ')."
+            }
         }
+        $summary.Found = $matchedUpdates.Count
+        if ($summary.Found -eq 0) {
+            if ($summary.ScanStatus -eq 'Succeeded') {
+                Write-Good 'No driver/firmware updates available from the configured source.'
+                if ($Apply) { $summary.InstallStatus = 'NoUpdates' }
+            }
+            return $summary
+        }
+        Write-Warn "$($summary.Found) update(s) found:"
+        $summary.Updates = @(foreach ($update in $matchedUpdates) {
+            Write-Host "    - $($update.Title)" -ForegroundColor White
+            $identity = $null
+            try { $identity = $update.Identity.UpdateID } catch { }
+            [pscustomobject]@{
+                Title              = $update.Title
+                UpdateId           = $identity
+                DownloadResultCode = $null
+                DownloadHResult    = $null
+                InstallResultCode  = $null
+                InstallHResult     = $null
+            }
+        })
+        $summary.Titles = @($summary.Updates.Title)
 
         if (-not $Apply) {
             Write-Info 'Scan only. Re-run with -AutoInstall to apply.'
             return $summary
         }
+        if ($summary.ScanStatus -ne 'Succeeded') { return $summary }
 
-        if (-not $PSCmdlet.ShouldProcess("$($result.Updates.Count) driver/firmware update(s)", 'Download and install')) {
+        if (-not $PSCmdlet.ShouldProcess("$($summary.Found) driver/firmware update(s)", 'Download and install')) {
             Write-Info 'Skipped by -WhatIf / -Confirm.'
+            $summary.InstallStatus = 'Skipped'
             return $summary
         }
 
-        $toInstall = New-Object -ComObject 'Microsoft.Update.UpdateColl' -ErrorAction Stop
-        foreach ($update in $result.Updates) {
-            if (-not $update.EulaAccepted) { $update.AcceptEula() }
-            $toInstall.Add($update) | Out-Null
+        $summary.InstallStatus = 'Failed'
+        $toDownload = New-Object -ComObject 'Microsoft.Update.UpdateColl' -ErrorAction Stop
+        foreach ($update in $matchedUpdates) {
+            if (-not $update.EulaAccepted) { $update.AcceptEula() | Out-Null }
+            $toDownload.Add($update) | Out-Null
         }
 
         Write-Info 'Downloading...'
         $downloader = $session.CreateUpdateDownloader()
-        $downloader.Updates = $toInstall
+        $downloader.Updates = $toDownload
         $downloadResult = $downloader.Download()
-        # ResultCode: 2 = succeeded, 3 = succeeded with errors, 4 = failed.
-        if ($downloadResult.ResultCode -eq 4) {
-            Write-Bad 'Download failed. Aborting install.'
-            $summary.InstallErrors += 'Windows Update download failed (ResultCode 4).'
+
+        $toInstall = New-Object -ComObject 'Microsoft.Update.UpdateColl' -ErrorAction Stop
+        $installDetails = @(for ($i = 0; $i -lt $toDownload.Count; $i++) {
+            $update = $toDownload.Item($i)
+            $detail = $summary.Updates[$i]
+            $itemResult = $downloadResult.GetUpdateResult($i)
+            $detail.DownloadResultCode = $itemResult.ResultCode
+            $detail.DownloadHResult = '0x{0:X8}' -f $itemResult.HResult
+            if ($itemResult.ResultCode -ne 2) {
+                $message = "$($detail.Title) download returned ResultCode $($detail.DownloadResultCode) (HResult $($detail.DownloadHResult))."
+                $summary.InstallErrors += $message
+                Write-Warn $message
+            }
+            if ($update.IsDownloaded) {
+                $toInstall.Add($update) | Out-Null
+                $detail
+            }
+        })
+        if ($downloadResult.ResultCode -notin @(2, 3) -or $toInstall.Count -eq 0) {
+            $message = "No installation performed (download ResultCode $($downloadResult.ResultCode), $($toInstall.Count) ready to install)."
+            Write-Bad $message
+            $summary.InstallErrors += $message
             return $summary
-        }
-        if ($downloadResult.ResultCode -eq 3) {
-            Write-Warn 'Download succeeded with errors. Continuing with what downloaded.'
         }
 
         Write-Info 'Installing...'
         $installer = $session.CreateUpdateInstaller()
         $installer.Updates = $toInstall
         $installResult = $installer.Install()
+        $summary.RebootRequired = [bool]$installResult.RebootRequired
 
-        $failed = 0
+        $successful = 0
         for ($i = 0; $i -lt $toInstall.Count; $i++) {
-            $updateResult = $installResult.GetUpdateResult($i)
-            # 2 = succeeded, 3 = succeeded with errors, 4 = failed, 5 = aborted.
-            if ($updateResult.ResultCode -eq 4 -or $updateResult.ResultCode -eq 5) {
-                $failed++
-                $hresult = '0x{0:X8}' -f $updateResult.HResult
-                $message = "$($toInstall.Item($i).Title) failed (ResultCode $($updateResult.ResultCode), HResult $hresult)"
+            $detail = $installDetails[$i]
+            $itemResult = $installResult.GetUpdateResult($i)
+            $detail.InstallResultCode = $itemResult.ResultCode
+            $detail.InstallHResult = '0x{0:X8}' -f $itemResult.HResult
+            if ($itemResult.ResultCode -in @(2, 3)) { $successful++ }
+            if ($itemResult.ResultCode -ne 2) {
+                $message = "$($detail.Title) installation returned ResultCode $($detail.InstallResultCode) (HResult $($detail.InstallHResult))."
                 $summary.InstallErrors += $message
                 Write-Bad $message
             }
         }
 
-        switch ($installResult.ResultCode) {
-            2 { Write-Good 'Installation succeeded.'; $summary.Installed = $true }
-            3 { Write-Warn 'Installation succeeded with errors. Check the log.'; $summary.Installed = $true }
-            default { Write-Bad "Install result code: $($installResult.ResultCode)" }
+        $summary.Installed = $successful -gt 0
+        if ($installResult.ResultCode -eq 2 -and $successful -eq $summary.Found -and $summary.InstallErrors.Count -eq 0) {
+            $summary.InstallStatus = 'Succeeded'
+            Write-Good 'Installation succeeded.'
         }
-
-        if ($installResult.RebootRequired) {
-            $summary.RebootRequired = $true
+        else {
+            if ($summary.Installed) { $summary.InstallStatus = 'Partial' }
+            $message = "Installation $($summary.InstallStatus.ToLowerInvariant()) (ResultCode $($installResult.ResultCode))."
+            Write-Warn $message
+            $summary.InstallErrors += $message
+        }
+        if ($summary.RebootRequired) {
             Write-Warn 'A reboot is required to finish installation.'
-            if ($AllowReboot -and (Test-IsInteractive)) {
-                if (Confirm-UserChoice -Message 'Reboot now?') {
-                    Restart-Computer -Force
-                }
-            }
-            elseif ($AllowReboot) {
-                Write-Info 'Reboot requested but this run is non-interactive; reboot was not performed.'
-            }
-        }
-
-        if ($failed -eq 0 -and $installResult.ResultCode -eq 2) {
-            $summary.Installed = $true
         }
         return $summary
     }
     catch {
         Write-Bad "Windows Update failed: $($_.Exception.Message)"
         $summary.InstallErrors += $_.Exception.Message
+        if ($Apply) { $summary.InstallStatus = 'Failed' }
         return $summary
     }
     finally {
-        foreach ($comObject in @($toInstall, $installer, $downloader, $searcher, $session)) {
+        $comObjects = $installResult, $downloadResult, $result, $installer, $downloader,
+                      $toInstall, $toDownload, $searcher, $session
+        foreach ($comObject in $comObjects) {
             if ($null -ne $comObject) {
                 try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObject) | Out-Null } catch { }
             }
@@ -420,16 +467,12 @@ function Invoke-WindowsUpdateDrivers {
 function Get-OemTool {
     param([Parameter(Mandatory = $true)]$Info)
 
-    $searchText = ("{0} {1} {2}" -f $Info.Manufacturer, $Info.Model, $Info.Motherboard).ToLowerInvariant()
-
-    # Ordered: manufacturer first in the text, so a board vendor in the
-    # motherboard string cannot override the system vendor. Store IDs are
-    # deliberately NOT hard-coded: they change and a stale ID fails
-    # confusingly. For those vendors, use SearchName in the Store / on the web.
+    # Check the system manufacturer before the model or motherboard vendor.
+    # For vendors without a mapped winget package, use SearchName.
     $candidates = @(
         @{ Pattern = 'dell';                Name = 'Dell Command | Update'; Id = 'Dell.CommandUpdate';  SearchName = 'Dell Command Update'; CliNames = @('dcu-cli.exe') }
         @{ Pattern = 'lenovo';              Name = 'Lenovo System Update';   Id = 'Lenovo.SystemUpdate'; SearchName = 'Lenovo System Update'; CliNames = @() }
-        @{ Pattern = 'hp|hewlett';          Name = 'HP Image Assistant';     Id = 'HP.ImageAssistant';  SearchName = 'HP Image Assistant';   CliNames = @() }
+        @{ Pattern = '\bhp\b|hewlett';      Name = 'HP Image Assistant';     Id = 'HP.ImageAssistant';  SearchName = 'HP Image Assistant';   CliNames = @() }
         @{ Pattern = 'microsoft|surface';   Name = 'Surface (via Windows Update)'; Id = $null; SearchName = 'Surface firmware'; CliNames = @() }
         @{ Pattern = 'asus|asustek';        Name = 'MyASUS';                 Id = $null; SearchName = 'MyASUS';                 CliNames = @() }
         @{ Pattern = 'msi|micro-star';      Name = 'MSI Center';             Id = $null; SearchName = 'MSI Center';             CliNames = @() }
@@ -439,9 +482,11 @@ function Get-OemTool {
         @{ Pattern = 'samsung';             Name = 'Samsung Update';         Id = $null; SearchName = 'Samsung Update';         CliNames = @() }
     )
 
-    foreach ($candidate in $candidates) {
-        if ($searchText -match $candidate.Pattern) {
-            return [pscustomobject]$candidate
+    foreach ($value in @($Info.Manufacturer, $Info.Model, $Info.Motherboard)) {
+        foreach ($candidate in $candidates) {
+            if ($value -match $candidate.Pattern) {
+                return [pscustomobject]$candidate
+            }
         }
     }
     return $null
@@ -458,7 +503,10 @@ function Test-OemToolInstalled {
 
 function Invoke-BiosRouting {
     [CmdletBinding(SupportsShouldProcess = $true)]
-    param([Parameter(Mandatory = $true)]$Info)
+    param(
+        [Parameter(Mandatory = $true)]$Info,
+        [switch]$RecommendOnly
+    )
 
     Write-Section 'BIOS / Firmware (OEM tool routing)'
     Write-Info "Current BIOS: $($Info.BiosVersion)  (released $($Info.BiosDate))"
@@ -493,6 +541,7 @@ function Invoke-BiosRouting {
         Write-Good "$($tool.Name) appears to be installed ($($installedCommand.Source)). Open it to review and apply BIOS/firmware updates."
         return $tool
     }
+    if ($RecommendOnly) { return $tool }
 
     if ($tool.Id) {
         if (-not (Test-IsInteractive) -and -not $Force) {
@@ -509,7 +558,7 @@ function Invoke-BiosRouting {
             try {
                 $wingetArgs = @('install', '--id', $tool.Id, '--accept-source-agreements', '--accept-package-agreements', '-e')
                 if (-not (Test-IsInteractive)) { $wingetArgs += '--disable-interactivity' }
-                & winget @wingetArgs
+                & winget @wingetArgs | Out-Host
                 if ($LASTEXITCODE -eq 0) {
                     Write-Good "$($tool.Name) installed. Open it to review and apply BIOS/firmware updates."
                 }
@@ -549,7 +598,13 @@ function Test-Winget {
 
 function Invoke-WingetUpgrade {
     [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
     Write-Section 'Application & Utility Upgrades (winget)'
+    if ($WhatIfPreference) {
+        $null = $PSCmdlet.ShouldProcess('all installed apps', 'winget upgrade --all')
+        return $false
+    }
 
     $winget = Test-Winget
     if ($null -eq $winget) {
@@ -559,7 +614,9 @@ function Invoke-WingetUpgrade {
     if ($winget.Version) { Write-Info "winget version: $($winget.Version)" }
 
     Write-Info 'Listing available upgrades...'
-    & winget upgrade --include-unknown
+    $listArgs = @('upgrade', '--include-unknown')
+    if (-not (Test-IsInteractive)) { $listArgs += '--disable-interactivity' }
+    & winget @listArgs | Out-Host
     if ($LASTEXITCODE -ne 0) {
         Write-Warn "winget upgrade listing returned exit code $LASTEXITCODE. Continuing to the prompt anyway."
     }
@@ -583,7 +640,7 @@ function Invoke-WingetUpgrade {
 
     $upgradeArgs = @('upgrade', '--all', '--include-unknown', '--accept-source-agreements', '--accept-package-agreements')
     if (-not (Test-IsInteractive)) { $upgradeArgs += '--disable-interactivity' }
-    & winget @upgradeArgs
+    & winget @upgradeArgs | Out-Host
     if ($LASTEXITCODE -eq 0) {
         Write-Good 'winget upgrade complete.'
         return $true
@@ -597,6 +654,15 @@ function Invoke-WingetUpgrade {
 # ---------------------------------------------------------------------------
 # Menu
 # ---------------------------------------------------------------------------
+function Update-WindowsUpdateReport {
+    param([Parameter(Mandatory = $true)]$Result)
+
+    $script:Report.WindowsUpdate = $Result
+    $script:Report.WindowsUpdateRuns += $Result
+    if ($Result.RebootRequired) { $script:Report.RebootRequired = $true }
+    $script:Report.Errors += $Result.InstallErrors
+}
+
 function Show-Menu {
     param([Parameter(Mandatory = $true)]$Info)
     while ($true) {
@@ -610,14 +676,19 @@ function Show-Menu {
         $selection = Read-Host 'Select'
         if ([string]::IsNullOrWhiteSpace($selection)) { continue }
         switch ($selection.ToUpperInvariant()) {
-            '1' { Invoke-WindowsUpdateDrivers | Out-Null }
-            '2' { Invoke-WindowsUpdateDrivers -Apply | Out-Null }
-            '3' { if ($SkipBiosRouting) { Write-Info 'BIOS routing skipped (-SkipBiosRouting).' } else { Invoke-BiosRouting -Info $Info | Out-Null } }
-            '4' { Invoke-WingetUpgrade | Out-Null }
+            '1' { Update-WindowsUpdateReport -Result (Invoke-WindowsUpdateDrivers) }
+            '2' { Update-WindowsUpdateReport -Result (Invoke-WindowsUpdateDrivers -Apply) }
+            '3' {
+                if ($SkipBiosRouting) { Write-Info 'BIOS routing skipped (-SkipBiosRouting).' }
+                else { $script:Report.BiosTool = (Invoke-BiosRouting -Info $Info | Select-Object -ExpandProperty Name) }
+            }
+            '4' { if (Invoke-WingetUpgrade) { $script:Report.WingetUpgraded = $true } }
             '5' {
-                Invoke-WindowsUpdateDrivers -Apply | Out-Null
-                if (-not $SkipBiosRouting) { Invoke-BiosRouting -Info $Info | Out-Null }
-                Invoke-WingetUpgrade | Out-Null
+                Update-WindowsUpdateReport -Result (Invoke-WindowsUpdateDrivers -Apply)
+                if (-not $SkipBiosRouting) {
+                    $script:Report.BiosTool = (Invoke-BiosRouting -Info $Info | Select-Object -ExpandProperty Name)
+                }
+                if (Invoke-WingetUpgrade) { $script:Report.WingetUpgraded = $true }
             }
             'Q' { return }
             default { Write-Warn 'Invalid choice.' }
@@ -650,34 +721,36 @@ try {
     }
     catch { }
 
-    $logDir = $LogDirectory
-    if ([string]::IsNullOrWhiteSpace($logDir)) {
-        $logDir = Join-Path $env:ProgramData 'SystemUpdateToolkit'
-    }
-    try {
-        if (-not (Test-Path -LiteralPath $logDir)) {
-            New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null
+    if (-not $WhatIfPreference) {
+        $logDir = $LogDirectory
+        if ([string]::IsNullOrWhiteSpace($logDir)) {
+            $logDir = Join-Path $env:ProgramData 'SystemUpdateToolkit'
         }
-    }
-    catch {
-        Write-Warn "Could not create log directory $logDir`: $($_.Exception.Message). Falling back to TEMP."
-        $logDir = Join-Path $env:TEMP 'SystemUpdateToolkit'
-        New-Item -ItemType Directory -Path $logDir -Force -ErrorAction SilentlyContinue | Out-Null
-    }
+        try {
+            if (-not (Test-Path -LiteralPath $logDir)) {
+                New-Item -ItemType Directory -Path $logDir -Force -Confirm:$false -ErrorAction Stop | Out-Null
+            }
+        }
+        catch {
+            Write-Warn "Could not create log directory $logDir`: $($_.Exception.Message). Falling back to TEMP."
+            $logDir = Join-Path $env:TEMP 'SystemUpdateToolkit'
+            New-Item -ItemType Directory -Path $logDir -Force -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        }
 
-    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $script:LogFile = Join-Path $logDir ("update_{0}.log" -f $timestamp)
-    $script:ReportFile = $ReportPath
-    if ([string]::IsNullOrWhiteSpace($script:ReportFile)) {
-        $script:ReportFile = Join-Path $logDir ("report_{0}.json" -f $timestamp)
-    }
+        $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+        $script:LogFile = Join-Path $logDir ("update_{0}.log" -f $timestamp)
+        $script:ReportFile = $ReportPath
+        if ([string]::IsNullOrWhiteSpace($script:ReportFile)) {
+            $script:ReportFile = Join-Path $logDir ("report_{0}.json" -f $timestamp)
+        }
 
-    try {
-        Start-Transcript -Path $script:LogFile -ErrorAction Stop | Out-Null
-        $script:TranscriptStarted = $true
-    }
-    catch {
-        Write-Warn "Transcript could not be started ($($_.Exception.Message)). Continuing without it; the JSON report will still be written."
+        try {
+            Start-Transcript -LiteralPath $script:LogFile -NoClobber -ErrorAction Stop | Out-Null
+            $script:TranscriptStarted = $true
+        }
+        catch {
+            Write-Warn "Transcript could not be started ($($_.Exception.Message)). Continuing without it; the JSON report will still be written."
+        }
     }
 
     $script:Report = [ordered]@{
@@ -687,6 +760,7 @@ try {
         Computer        = $env:COMPUTERNAME
         System          = $null
         WindowsUpdate   = $null
+        WindowsUpdateRuns = @()
         BiosTool        = $null
         WingetUpgraded  = $false
         RebootRequired  = $false
@@ -696,17 +770,14 @@ try {
     $info = Get-SystemInfo
     $script:Report.System = $info
 
-    $automated = [bool]$AutoInstall -or [bool]$IncludeApps -or $script:IsNonInteractive
+    $automated = $ScanOnly -or $AutoInstall -or $IncludeApps -or $script:IsNonInteractive
 
     if ($automated) {
         # Non-interactive path: no menu, no Read-Host surprises.
-        $wuResult = Invoke-WindowsUpdateDrivers -Apply:$AutoInstall
-        $script:Report.WindowsUpdate = $wuResult
-        if ($wuResult.RebootRequired) { $script:Report.RebootRequired = $true }
-        if ($wuResult.InstallErrors) { $script:Report.Errors += $wuResult.InstallErrors }
+        Update-WindowsUpdateReport -Result (Invoke-WindowsUpdateDrivers -Apply:$AutoInstall)
 
         if (-not $SkipBiosRouting) {
-            $biosTool = Invoke-BiosRouting -Info $info
+            $biosTool = Invoke-BiosRouting -Info $info -RecommendOnly:$ScanOnly
             if ($null -ne $biosTool) { $script:Report.BiosTool = $biosTool.Name }
         }
 
@@ -727,18 +798,26 @@ catch {
 finally {
     if ($null -ne $script:Report -and $null -ne $script:ReportFile) {
         try {
-            $script:Report | ConvertTo-Json -Depth 4 -ErrorAction Stop |
-                Set-Content -Path $script:ReportFile -Encoding utf8 -ErrorAction Stop
+            $script:Report | ConvertTo-Json -Depth 6 -ErrorAction Stop |
+                Set-Content -LiteralPath $script:ReportFile -Encoding utf8 -Confirm:$false -ErrorAction Stop
             Write-Info "Report saved to: $($script:ReportFile)"
         }
         catch {
             Write-Warn "Could not write JSON report: $($_.Exception.Message)"
         }
     }
-    if ($null -ne $script:LogFile) {
+    if ($script:TranscriptStarted) {
         Write-Info "Log saved to: $($script:LogFile)"
     }
     if ($script:TranscriptStarted) {
         try { Stop-Transcript -ErrorAction Stop | Out-Null } catch { }
+    }
+}
+
+if ($AllowReboot -and $null -ne $script:Report -and $script:Report.RebootRequired) {
+    if ((Test-IsInteractive) -and $PSCmdlet.ShouldProcess($env:COMPUTERNAME, 'Restart after installing updates')) {
+        if (Confirm-UserChoice -Message 'Reboot now?') {
+            Restart-Computer -Force -Confirm:$false
+        }
     }
 }

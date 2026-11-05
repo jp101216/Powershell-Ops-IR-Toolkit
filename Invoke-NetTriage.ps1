@@ -13,9 +13,8 @@
         including tunnel adapter IP for either client)
       - Proxy configuration (WinHTTP + per-user IE/WinInet settings)
       - Latency/quality metrics (RTT + packet loss to gateway/DNS, DNS resolve time)
-      - Core infrastructure health (TCP reachability + connect latency).
-        The target list can be overridden via a CoreInfrastructure.json file
-        placed alongside the script.
+      - Core infrastructure health (TCP reachability + connect latency)
+        using a CoreInfrastructure.json file or -CoreInfrastructurePath.
       - Optional single-target diagnostic (DNS + ping + multi-port TCP test)
       - External/egress IP
 
@@ -56,6 +55,21 @@
 .PARAMETER SkipExternalIP
     Skip the outbound egress-IP lookup (useful on locked-down egress).
 
+.PARAMETER SkipPublicProbes
+    Skip the built-in public DNS name lookup, public TCP probe, and egress-IP
+    lookup. Local checks and explicitly configured destinations still run.
+
+.PARAMETER DnsProbeName
+    DNS name to resolve for the timed DNS check. Defaults to www.microsoft.com
+    unless -SkipPublicProbes is set. An explicit name works with either mode.
+
+.PARAMETER CoreInfrastructurePath
+    Path to a JSON array of objects with Name, Host, and Port properties.
+    Defaults to CoreInfrastructure.json beside the script when present.
+
+.PARAMETER NonInteractive
+    Skip the target prompt when -TargetDestination is omitted.
+
 .PARAMETER Quiet
     Suppress the colored dashboard and emit only the plain-text ServiceNow
     summary to the console. Also auto-copies that summary to the clipboard.
@@ -74,6 +88,10 @@
 .EXAMPLE
     .\Invoke-NetTriage.ps1 -TargetDestination fileserver01 -TargetPorts 445,139,3389
     Test a file/RDP server on specific ports.
+
+.EXAMPLE
+    .\Invoke-NetTriage.ps1 -NonInteractive -SkipPublicProbes -DnsProbeName intranet.example.com -CoreInfrastructurePath .\BranchOffice.json
+    Check the configured infrastructure and internal DNS name.
 
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
@@ -94,14 +112,25 @@ param (
     [string]$TargetDestination = "",
 
     [Alias('TargetPort')]
+    [ValidateRange(1, 65535)]
     [int[]] $TargetPorts        = @(443, 80, 445, 3389),
 
-    [string]$ExportPath         = "$env:LOCALAPPDATA\NetTriage\Triage_$((Get-Date).ToString('yyyyMMdd_HHmmss')).json",
+    [string]$ExportPath         = "$env:LOCALAPPDATA\NetTriage\Triage_$((Get-Date).ToString('yyyyMMdd_HHmmss_fff')).json",
+    [ValidateRange(1, 20)]
     [int]   $PingCount          = 4,
+    [ValidateRange(1, 60000)]
     [int]   $TcpTimeoutMs       = 1500,
+    [ValidateRange(1, 60000)]
     [int]   $PingTimeoutMs      = 1000,
+    [ValidateRange(0, [int]::MaxValue)]
     [int]   $RetainCount        = 20,
     [switch]$SkipExternalIP,
+    [switch]$SkipPublicProbes,
+    [ValidateNotNullOrEmpty()]
+    [string]$DnsProbeName,
+    [ValidateNotNullOrEmpty()]
+    [string]$CoreInfrastructurePath,
+    [switch]$NonInteractive,
     [switch]$Quiet,
     [switch]$CopyToClipboard
 )
@@ -131,29 +160,39 @@ $Findings = New-Object System.Collections.Generic.List[object]
 # --------------------------------------------------------------------------
 # CORE INFRASTRUCTURE  (organization reachability targets)
 # --------------------------------------------------------------------------
-$CoreInfrastructure = @(
-    @{ Name = "Internet Reachability";         Host = "8.8.8.8";                       Port = 53  }
-    @{ Name = "SharePoint (Cloud)";            Host = "yourorg.sharepoint.com";        Port = 443 }
-    @{ Name = "Identity Federation (SSO)";     Host = "sso.corp.example.com";           Port = 443 }
-    @{ Name = "Active Directory (Round Robin)";Host = "corp.example.com";               Port = 389 }
-    @{ Name = "Specific DC (DC01)";            Host = "DC01.corp.example.com";          Port = 389 }
-)
-
-# Optional override: drop a CoreInfrastructure.json (array of {Name,Host,Port})
-# next to this script to change targets without editing script code.
-$CoreInfraConfigPath = Join-Path -Path $PSScriptRoot -ChildPath 'CoreInfrastructure.json'
-if ($PSScriptRoot -and (Test-Path $CoreInfraConfigPath)) {
-    try {
-        $CustomInfra = Get-Content -Path $CoreInfraConfigPath -Raw | ConvertFrom-Json -ErrorAction Stop
-        if ($CustomInfra) {
-            $CoreInfrastructure = @($CustomInfra | ForEach-Object {
-                @{ Name = $_.Name; Host = $_.Host; Port = [int]$_.Port }
-            })
+$CoreInfrastructure = @()
+if (-not $CoreInfrastructurePath) {
+    $defaultConfigPath = Join-Path -Path $PSScriptRoot -ChildPath 'CoreInfrastructure.json'
+    if (Test-Path -LiteralPath $defaultConfigPath -PathType Leaf) {
+        $CoreInfrastructurePath = $defaultConfigPath
+    }
+}
+if ($CoreInfrastructurePath) {
+    $configJson = Get-Content -LiteralPath $CoreInfrastructurePath -Raw -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($configJson) -or -not $configJson.TrimStart().StartsWith('[')) {
+        throw "Infrastructure config '$CoreInfrastructurePath' must contain a JSON array."
+    }
+    # Wrap the JSON to preserve null entries and empty arrays in both editions.
+    $config = ('{"Targets":' + $configJson + '}') | ConvertFrom-Json -ErrorAction Stop
+    if ($config.Targets -isnot [array] -or @($config.PSObject.Properties).Count -ne 1) {
+        throw "Infrastructure config '$CoreInfrastructurePath' must contain a JSON array."
+    }
+    $CoreInfrastructure = @(for ($i = 0; $i -lt $config.Targets.Count; $i++) {
+        $targetConfig = $config.Targets[$i]
+        $portNumber = 0
+        if ($targetConfig.Name -isnot [string] -or [string]::IsNullOrWhiteSpace($targetConfig.Name) -or
+            $targetConfig.Host -isnot [string] -or [string]::IsNullOrWhiteSpace($targetConfig.Host) -or
+            -not [int]::TryParse([string]$targetConfig.Port, [ref]$portNumber) -or $portNumber -lt 1 -or $portNumber -gt 65535) {
+            throw "Infrastructure config '$CoreInfrastructurePath', entry $($i + 1): expected Name, Host, and a TCP port from 1 to 65535."
         }
-    }
-    catch {
-        Write-Warning "Failed to load CoreInfrastructure.json - using built-in defaults: $($_.Exception.Message)"
-    }
+        @{ Name = $targetConfig.Name.Trim(); Host = $targetConfig.Host.Trim(); Port = $portNumber }
+    })
+}
+elseif (-not $SkipPublicProbes) {
+    $CoreInfrastructure = @(@{ Name = 'Public DNS TCP probe'; Host = '8.8.8.8'; Port = 53 })
+}
+if (-not $DnsProbeName -and -not $SkipPublicProbes) {
+    $DnsProbeName = 'www.microsoft.com'
 }
 
 # ==========================================================================
@@ -251,10 +290,12 @@ function Test-TcpPort {
         return $result
     }
     $client = New-Object System.Net.Sockets.TcpClient
+    $waitHandle = $null
     try {
         $sw  = [System.Diagnostics.Stopwatch]::StartNew()
         $iar = $client.BeginConnect($ComputerName, $Port, $null, $null)
-        if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+        $waitHandle = $iar.AsyncWaitHandle
+        if ($waitHandle.WaitOne($TimeoutMs, $false)) {
             $client.EndConnect($iar)   # throws if the connection was refused
             $sw.Stop()
             $result.Success   = $true
@@ -269,6 +310,7 @@ function Test-TcpPort {
     }
     finally {
         $client.Close()
+        if ($null -ne $waitHandle) { $waitHandle.Dispose() }
     }
     return $result
 }
@@ -437,20 +479,23 @@ function Get-ProxyConfig {
 
 function Remove-OldTriageExports {
     <# Prunes Triage_*.json/.txt pairs beyond -Keep, oldest first. #>
-    param([string]$Directory, [int]$Keep = 20)
-    if ($Keep -le 0 -or -not $Directory -or -not (Test-Path $Directory)) { return }
+    param([string]$Directory, [int]$Keep = 20, [string]$CurrentPath)
+    if ($Keep -le 0 -or -not $Directory) { return }
     try {
-        $files = @(Get-ChildItem -Path $Directory -Filter 'Triage_*.json' -File -ErrorAction SilentlyContinue |
+        $files = @(Get-ChildItem -LiteralPath $Directory -Filter 'Triage_*.json' -File -ErrorAction Stop |
+                 Where-Object { $_.Name -match '^Triage_\d{8}_\d{6}(?:_\d{3})?\.json$' } |
                  Sort-Object LastWriteTime -Descending)
-        if ($files.Count -gt $Keep) {
-            foreach ($old in ($files | Select-Object -Skip $Keep)) {
-                Remove-Item -Path $old.FullName -Force -ErrorAction SilentlyContinue
-                $txt = [System.IO.Path]::ChangeExtension($old.FullName, 'txt')
-                if (Test-Path $txt) { Remove-Item -Path $txt -Force -ErrorAction SilentlyContinue }
+        $current = @( $files | Where-Object { $_.FullName -eq $CurrentPath } )
+        $older = $files | Where-Object { $_.FullName -ne $CurrentPath } | Select-Object -Skip ($Keep - $current.Count)
+        foreach ($old in $older) {
+            Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop
+            $txt = [System.IO.Path]::ChangeExtension($old.FullName, 'txt')
+            if (Test-Path -LiteralPath $txt -PathType Leaf) {
+                Remove-Item -LiteralPath $txt -Force -ErrorAction Stop
             }
         }
     }
-    catch { }
+    catch { Write-Warning "Export pruning failed: $($_.Exception.Message)" }
 }
 
 function Build-ServiceNowSummary {
@@ -538,8 +583,11 @@ function Build-ServiceNowSummary {
     else {
         $L.Add('  DNS           : n/a')
     }
-    if ($null -ne $Data.Latency.DNS_ResolveMs) {
-        $L.Add(("  DNS resolve   : {0} ms" -f $Data.Latency.DNS_ResolveMs))
+    if ($Data.Latency.DNS_ProbeError) {
+        $L.Add(("  DNS resolve   : {0} failed" -f $Data.Latency.DNS_ProbeName))
+    }
+    elseif ($null -ne $Data.Latency.DNS_ResolveMs) {
+        $L.Add(("  DNS resolve   : {0} in {1} ms" -f $Data.Latency.DNS_ProbeName, $Data.Latency.DNS_ResolveMs))
     }
     $L.Add('')
 
@@ -682,8 +730,11 @@ function Show-Dashboard {
     if ($Data.Latency.DNS) {
         Write-Field ("DNS ({0})" -f $Data.Latency.DNS.Target) (Format-PingStat $Data.Latency.DNS)
     }
-    if ($null -ne $Data.Latency.DNS_ResolveMs) {
-        Write-Field 'DNS resolve' ("{0} ms" -f $Data.Latency.DNS_ResolveMs) (Get-MetricColor -Value $Data.Latency.DNS_ResolveMs -Warn $Thresholds.DnsMs.Warn -Crit $Thresholds.DnsMs.Crit)
+    if ($Data.Latency.DNS_ProbeError) {
+        Write-Field 'DNS resolve' "$($Data.Latency.DNS_ProbeName) failed" Yellow
+    }
+    elseif ($null -ne $Data.Latency.DNS_ResolveMs) {
+        Write-Field 'DNS resolve' ("{0} in {1} ms" -f $Data.Latency.DNS_ProbeName, $Data.Latency.DNS_ResolveMs) (Get-MetricColor -Value $Data.Latency.DNS_ResolveMs -Warn $Thresholds.DnsMs.Warn -Crit $Thresholds.DnsMs.Crit)
     }
     Write-Host ''
 
@@ -741,7 +792,7 @@ if ([string]::IsNullOrWhiteSpace($TargetDestination)) {
         if ([Console]::IsInputRedirected) { $isInteractive = $false }
     }
     catch { }
-    if ($isInteractive -and -not $Quiet) {
+    if ($isInteractive -and -not $Quiet -and -not $NonInteractive) {
         $prompted = Read-Host 'Target hostname/IP to diagnose (press Enter to skip)'
         if (-not [string]::IsNullOrWhiteSpace($prompted)) { $TargetDestination = $prompted.Trim() }
     }
@@ -791,13 +842,17 @@ $Data = [ordered]@{
         Gateway        = $null
         DNS            = $null
         DNS_ResolveMs  = $null
+        DNS_ProbeName  = $DnsProbeName
+        DNS_ProbeError = $null
     }
     CoreInfrastructure = @()
     Target       = $null
     ExternalIP   = $null
+    Findings     = @()
 }
 
 # ---- System baseline ----
+$osInfo = $null
 try {
     $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
     $csInfo = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
@@ -817,6 +872,7 @@ catch {
 }
 
 # ---- Performance snapshot ----
+$processors = @()
 try {
     $processors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
     if ($processors.Count -gt 0) {
@@ -829,13 +885,12 @@ try {
 catch { Write-Warning "CPU load collection failed: $($_.Exception.Message)" }
 
 try {
-    $osMem = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-    if ($osMem.TotalVisibleMemorySize -gt 0) {
-        $totalGB = [math]::Round($osMem.TotalVisibleMemorySize / 1MB, 1)
-        $freeGB = [math]::Round($osMem.FreePhysicalMemory / 1MB, 1)
-        $Data.Performance.Memory_TotalGB = $totalGB
-        $Data.Performance.Memory_FreeGB = $freeGB
-        $Data.Performance.Memory_UsedPct = [math]::Round((($totalGB - $freeGB) / $totalGB) * 100, 0)
+    if ($null -ne $osInfo -and $osInfo.TotalVisibleMemorySize -gt 0) {
+        $totalKB = $osInfo.TotalVisibleMemorySize
+        $freeKB = $osInfo.FreePhysicalMemory
+        $Data.Performance.Memory_TotalGB = [math]::Round($totalKB / 1MB, 1)
+        $Data.Performance.Memory_FreeGB = [math]::Round($freeKB / 1MB, 1)
+        $Data.Performance.Memory_UsedPct = [math]::Round((($totalKB - $freeKB) / $totalKB) * 100, 0)
     }
 }
 catch { Write-Warning "Memory collection failed: $($_.Exception.Message)" }
@@ -859,14 +914,11 @@ try {
 catch { Write-Warning "Disk collection failed: $($_.Exception.Message)" }
 
 try {
-    $logicalProcessors = 1
-    try {
-        $cpuCount = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
-        if ($cpuCount.Count -gt 0) { $logicalProcessors = 0 }
-        foreach ($cpu in $cpuCount) { $logicalProcessors += $cpu.NumberOfLogicalProcessors }
-        if ($logicalProcessors -le 0) { $logicalProcessors = 1 }
+    $logicalProcessors = [Environment]::ProcessorCount
+    if ($processors.Count -gt 0) {
+        $cpuCount = ($processors | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+        if ($cpuCount -gt 0) { $logicalProcessors = $cpuCount }
     }
-    catch { $logicalProcessors = 1 }
     $topCpu = Get-TopCpuProcesses -Top 3 -LogicalProcessors $logicalProcessors
     $Data.Performance.TopCPU = @($topCpu | ForEach-Object { "{0} ({1}%)" -f $_.Name, $_.PctCpu })
 }
@@ -994,20 +1046,21 @@ if ($Data.Network.Gateway) {
 if ($Data.Network.DNS -and $Data.Network.DNS.Count -gt 0) {
     $Data.Latency.DNS = Get-PingStats -ComputerName $Data.Network.DNS[0] -Count $PingCount -TimeoutMs $PingTimeoutMs
 }
-try {
-    $dnsStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $dnsCmd = Get-Command -Name 'Resolve-DnsName' -ErrorAction SilentlyContinue
-    if ($dnsCmd) {
-        $null = Resolve-DnsName -Name 'www.microsoft.com' -Type A -ErrorAction Stop
+if ($DnsProbeName) {
+    try {
+        $dnsCmd = Get-Command -Name 'Resolve-DnsName' -ErrorAction SilentlyContinue
+        $dnsStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        if ($dnsCmd) {
+            $null = Resolve-DnsName -Name $DnsProbeName -DnsOnly -ErrorAction Stop
+        }
+        else {
+            $null = [System.Net.Dns]::GetHostAddresses($DnsProbeName)
+        }
+        $Data.Latency.DNS_ResolveMs = [math]::Round($dnsStopwatch.Elapsed.TotalMilliseconds, 0)
     }
-    else {
-        $null = [System.Net.Dns]::GetHostAddresses('www.microsoft.com')
+    catch {
+        $Data.Latency.DNS_ProbeError = $_.Exception.Message
     }
-    $dnsStopwatch.Stop()
-    $Data.Latency.DNS_ResolveMs = [math]::Round($dnsStopwatch.Elapsed.TotalMilliseconds, 0)
-}
-catch {
-    $Data.Latency.DNS_ResolveMs = $null
 }
 
 # ---- Core infrastructure reachability ----
@@ -1071,7 +1124,7 @@ if (-not [string]::IsNullOrWhiteSpace($TargetDestination)) {
 }
 
 # ---- Egress IP ----
-if (-not $SkipExternalIP) {
+if (-not $SkipExternalIP -and -not $SkipPublicProbes) {
     try {
         $egress = Invoke-RestMethod -Uri 'https://ifconfig.me/ip' -TimeoutSec 5 -ErrorAction Stop
         $Data.ExternalIP = "$egress".Trim()
@@ -1146,7 +1199,10 @@ if ($Data.Latency.Gateway -and $null -ne $Data.Latency.Gateway.AvgMs) {
         Add-Finding 'Warn' ("Gateway packet loss {0}%" -f $Data.Latency.Gateway.LossPct)
     }
 }
-if ($null -ne $Data.Latency.DNS_ResolveMs) {
+if ($Data.Latency.DNS_ProbeError) {
+    Add-Finding 'Warn' ("DNS probe for {0} failed: {1}" -f $DnsProbeName, $Data.Latency.DNS_ProbeError)
+}
+elseif ($null -ne $Data.Latency.DNS_ResolveMs) {
     if ($Data.Latency.DNS_ResolveMs -ge $Thresholds.DnsMs.Crit) {
         Add-Finding 'Crit' ("DNS resolve time {0} ms is critically slow" -f $Data.Latency.DNS_ResolveMs)
     }
@@ -1166,9 +1222,10 @@ if ($Data.Target -and $Data.Target.Ports) {
         }
     }
     if ($Data.Target.Ping -and $Data.Target.Ping.Received -eq 0) {
-        Add-Finding 'Fail' ("Target {0} did not respond to ping (100% loss)" -f $Data.Target.Destination)
+        Add-Finding 'Warn' ("Target {0} did not respond to ICMP ping (100% loss)" -f $Data.Target.Destination)
     }
 }
+$Data.Findings = @($Findings.ToArray())
 
 # ---- Export (JSON + plain-text summary), then prune old exports ----
 # RECONSTRUCTED in v2. ExportPath is a file path, not a folder, so the
@@ -1177,15 +1234,16 @@ $exportDirectory = $null
 $txtPath = $null
 $exportSucceeded = $false
 try {
-    $exportDirectory = Split-Path -Parent $ExportPath
-    if ([string]::IsNullOrWhiteSpace($exportDirectory)) { $exportDirectory = Get-Location }
-    if (-not (Test-Path -LiteralPath $exportDirectory)) {
-        New-Item -ItemType Directory -Path $exportDirectory -Force | Out-Null
-    }
+    $ExportPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ExportPath)
     $txtPath = [System.IO.Path]::ChangeExtension($ExportPath, 'txt')
+    if ($txtPath -eq $ExportPath) { throw 'The JSON export path and text summary path must be different.' }
+    $exportDirectory = Split-Path -Parent $ExportPath
+    if (-not (Test-Path -LiteralPath $exportDirectory)) {
+        [System.IO.Directory]::CreateDirectory($exportDirectory) | Out-Null
+    }
     $summaryText = Build-ServiceNowSummary -Data $Data -FindingsList $Findings -JsonPath $ExportPath
-    $Data | ConvertTo-Json -Depth 6 | Set-Content -Path $ExportPath -Encoding UTF8 -Force
-    $summaryText | Set-Content -Path $txtPath -Encoding UTF8 -Force
+    $Data | ConvertTo-Json -Depth 6 -ErrorAction Stop | Set-Content -LiteralPath $ExportPath -Encoding UTF8 -Force -ErrorAction Stop
+    $summaryText | Set-Content -LiteralPath $txtPath -Encoding UTF8 -Force -ErrorAction Stop
     $exportSucceeded = $true
 }
 catch {
@@ -1195,20 +1253,14 @@ catch {
 }
 
 if ($exportSucceeded -and $exportDirectory) {
-    Remove-OldTriageExports -Directory $exportDirectory -Keep $RetainCount
+    Remove-OldTriageExports -Directory $exportDirectory -Keep $RetainCount -CurrentPath $ExportPath
 }
 
 # ---- Output ----
 if ($Quiet) {
     # Plain-text summary only. This is the last output, so a pipeline
     # like '-Quiet | clip' receives only the summary.
-    if ($CopyToClipboard) {
-        try { $summaryText | Set-Clipboard -ErrorAction Stop } catch { Write-Warning "Could not copy summary to clipboard: $($_.Exception.Message)" }
-    }
-    else {
-        # Quiet implies clipboard per the README / help.
-        try { $summaryText | Set-Clipboard -ErrorAction Stop } catch { Write-Warning "Could not copy summary to clipboard: $($_.Exception.Message)" }
-    }
+    try { $summaryText | Set-Clipboard -ErrorAction Stop } catch { Write-Warning "Could not copy summary to clipboard: $($_.Exception.Message)" }
     Write-Output $summaryText
 }
 else {

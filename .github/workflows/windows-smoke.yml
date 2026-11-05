@@ -1,0 +1,43 @@
+name: Windows smoke tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Smoke tests (${{ matrix.shell }})
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check toolkit with Windows PowerShell
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: ./tests/Test-Toolkit.ps1 -IncludeWindowsUpdateScan
+      - name: Check toolkit with PowerShell 7
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: ./tests/Test-Toolkit.ps1 -IncludeWindowsUpdateScan
+
+  maintenance:
+    name: Windows 11 maintenance
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check toolkit and run maintenance
+        shell: pwsh
+        run: ./tests/Test-Toolkit.ps1 -IncludeWindowsUpdateScan -RunMaintenance -InstallTestDriver
