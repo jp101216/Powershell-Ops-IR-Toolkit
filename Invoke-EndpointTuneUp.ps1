@@ -94,6 +94,14 @@
         with the original defaults preserved. Old JSON reports are
         pruned alongside old logs.
 
+.PARAMETER Phase
+    Run one or more of Network, Cleanup, and Optimize, in that order.
+    Defaults to all three phases. Omitted steps appear as skipped in the report.
+
+.PARAMETER SkipTempCleanup
+    Skip temp folder cleanup. Combine with -Phase Cleanup -DeepClean to run
+    DISM and SFC without clearing temp folders.
+
 .PARAMETER SkipStackReset
     Skip 'netsh winsock reset' and 'netsh int ip/ipv6 reset'. Use this on
     machines with STATIC IP configs (the stack reset wipes them) or when a
@@ -152,27 +160,27 @@
     TuneUp_<HOST>_<timestamp>.json file inside LogDirectory.
 
 .PARAMETER LogRetentionDays
-    Prune TuneUp log and JSON report files older than this many days from
+    Prune tune-up transcripts, JSON reports, and network snapshots older than this many days from
     LogDirectory after a successful log-directory setup. Default 90.
     Use 0 to disable pruning.
 
 .EXAMPLE
-    powershell.exe -ExecutionPolicy Bypass -File .\Invoke-EndpointTuneUp-v2.ps1
+    powershell.exe -ExecutionPolicy Bypass -File .\Invoke-EndpointTuneUp.ps1
 
 .EXAMPLE
-    powershell.exe -ExecutionPolicy Bypass -File .\Invoke-EndpointTuneUp-v2.ps1 -DeepClean -Reboot
+    powershell.exe -ExecutionPolicy Bypass -File .\Invoke-EndpointTuneUp.ps1 -DeepClean -Reboot
 
 .EXAMPLE
     # Fragile connection: keep the session alive, skip reboot-dependent resets
-    powershell.exe -ExecutionPolicy Bypass -File .\Invoke-EndpointTuneUp-v2.ps1 -SkipAdapterRestart -SkipStackReset
+    powershell.exe -ExecutionPolicy Bypass -File .\Invoke-EndpointTuneUp.ps1 -SkipAdapterRestart -SkipStackReset
 
 .EXAMPLE
     # Dry run: show what would change, change nothing (including no reboot)
-    powershell.exe -ExecutionPolicy Bypass -File .\Invoke-EndpointTuneUp-v2.ps1 -DeepClean -Reboot -WhatIf
+    powershell.exe -ExecutionPolicy Bypass -File .\Invoke-EndpointTuneUp.ps1 -DeepClean -Reboot -WhatIf
 
 .EXAMPLE
     # Quiet, ticket-ready run with a JSON report for automation
-    powershell.exe -ExecutionPolicy Bypass -File .\Invoke-EndpointTuneUp-v2.ps1 -Quiet -ReportPath C:\Reports\TuneUp.json
+    powershell.exe -ExecutionPolicy Bypass -File .\Invoke-EndpointTuneUp.ps1 -Quiet -ReportPath C:\Reports\TuneUp.json
 
 .NOTES
     Must run elevated. The #Requires line enforces this on Windows.
@@ -184,6 +192,9 @@
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
+    [ValidateSet('Network', 'Cleanup', 'Optimize')]
+    [string[]]$Phase = @('Network', 'Cleanup', 'Optimize'),
+    [switch]$SkipTempCleanup,
     [switch]$SkipStackReset,
     [switch]$SkipAdapterRestart,
     [switch]$ClearRecycleBin,
@@ -223,7 +234,7 @@ $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 # ---------------------------------------------------------------- logging ---
 function Write-Log {
     param(
-        [Parameter(Mandatory = $true)][string]$Message,
+        [AllowEmptyString()][Parameter(Mandatory = $true)][string]$Message,
         [ValidateSet('Info', 'Warn', 'Error', 'Good')][string]$Level = 'Info'
     )
     # Quiet mode: only warnings and errors reach the console. The final
@@ -315,8 +326,13 @@ function Invoke-Step {
         [Parameter(Mandatory = $true)][scriptblock]$Action,
         [switch]$ReadOnly,
         [string]$Target,
-        [string]$Operation
+        [string]$Operation,
+        [string]$Prompt
     )
+    if ($script:CurrentPhase -ne 'Summary' -and $Phase -notcontains $script:CurrentPhase) {
+        Add-SkippedStep -Name $Name -Reason "Phase excluded by -Phase ($($script:CurrentPhase))"
+        return
+    }
     if (-not $ReadOnly) {
         $targetName = $Name
         if (-not [string]::IsNullOrWhiteSpace($Target)) { $targetName = $Target }
@@ -325,6 +341,13 @@ function Invoke-Step {
         if (-not $PSCmdlet.ShouldProcess($targetName, $operationName)) {
             Write-Log "    skipped (WhatIf/Confirm): $Name" -Level Warn
             Add-SkippedStep -Name $Name -Reason 'Skipped by -WhatIf / -Confirm'
+            return
+        }
+        if ($Prompt -and -not (Confirm-UserChoice -Message $Prompt)) {
+            $reason = 'Not confirmed by user'
+            if (-not (Test-IsInteractive)) { $reason = 'Skipped in non-interactive mode without -Force' }
+            Write-Log "    skipped: $Name ($reason)" -Level Warn
+            Add-SkippedStep -Name $Name -Reason $reason
             return
         }
     }
@@ -386,8 +409,8 @@ function Format-FreeSpaceGB {
 
 function Write-Summary {
     param(
-        [Parameter(Mandatory = $true)]$FreeBefore,
-        [Parameter(Mandatory = $true)]$FreeAfter
+        [AllowNull()][Parameter(Mandatory = $true)]$FreeBefore,
+        [AllowNull()][Parameter(Mandatory = $true)]$FreeAfter
     )
     $spaceFreed = $null
     if ($null -ne $FreeBefore -and $null -ne $FreeAfter) {
@@ -421,13 +444,10 @@ function Write-Summary {
             "Log file       : $($script:LogFile)"
             "Report file    : $($script:ReportFile)"
         )
-        foreach ($line in $pasteLines) { Write-Host $line }
-        try {
-            Set-Clipboard -Value ($pasteLines -join "`r`n") -ErrorAction Stop
-        }
-        catch {
-            # Clipboard copy is best-effort only, e.g. in a non-interactive
-            # or remote session. Never fail the run over it.
+        $pasteText = $pasteLines -join "`r`n"
+        Write-Output $pasteText
+        if (-not $WhatIfPreference) {
+            try { Set-Clipboard -Value $pasteText -ErrorAction Stop } catch { }
         }
         return
     }
@@ -480,49 +500,56 @@ try {
     catch { }
 
     # ------------------------------------------------------------ logging ---
-    $logDir = $LogDirectory
-    if ([string]::IsNullOrWhiteSpace($logDir)) {
-        $logDir = 'C:\ProgramData\EndpointTuneUp\Logs'
-    }
-    try {
-        if (-not (Test-Path -LiteralPath $logDir)) {
-            New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null
+    if (-not $WhatIfPreference) {
+        $logDir = $LogDirectory
+        if ([string]::IsNullOrWhiteSpace($logDir)) {
+            $logDir = 'C:\ProgramData\EndpointTuneUp\Logs'
         }
-    }
-    catch {
-        Write-Log "Could not create log directory $logDir`: $($_.Exception.Message). Falling back to TEMP." -Level Warn
-        $logDir = Join-Path $env:TEMP 'EndpointTuneUp\Logs'
-        New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null
-    }
-
-    if ($LogRetentionDays -gt 0) {
         try {
-            Get-ChildItem -Path $logDir -Filter 'TuneUp_*' -File -ErrorAction Stop |
-                Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$LogRetentionDays) } |
-                Remove-Item -Force -ErrorAction Stop
+            if (-not (Test-Path -LiteralPath $logDir)) {
+                New-Item -ItemType Directory -Path $logDir -Force -Confirm:$false -ErrorAction Stop | Out-Null
+            }
         }
         catch {
-            Write-Log "Old log/report pruning failed (continuing): $($_.Exception.Message)" -Level Warn
+            Write-Log "Could not create log directory $logDir`: $($_.Exception.Message). Falling back to TEMP." -Level Warn
+            $logDir = Join-Path $env:TEMP 'EndpointTuneUp\Logs'
+            New-Item -ItemType Directory -Path $logDir -Force -Confirm:$false -ErrorAction Stop | Out-Null
         }
-    }
 
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $script:LogFile = Join-Path $logDir ("TuneUp_{0}_{1}.log" -f $env:COMPUTERNAME, $timestamp)
-    $script:ReportFile = $ReportPath
-    if ([string]::IsNullOrWhiteSpace($script:ReportFile)) {
-        $script:ReportFile = Join-Path $logDir ("TuneUp_{0}_{1}.json" -f $env:COMPUTERNAME, $timestamp)
-    }
-    if ($script:QuietMode) {
-        $script:IpconfigBeforeFile = Join-Path $logDir ("IpconfigBefore_{0}_{1}.txt" -f $env:COMPUTERNAME, $timestamp)
-        $script:IpconfigAfterFile = Join-Path $logDir ("IpconfigAfter_{0}_{1}.txt" -f $env:COMPUTERNAME, $timestamp)
-    }
+        if ($LogRetentionDays -gt 0) {
+            try {
+                $cutoff = (Get-Date).AddDays(-$LogRetentionDays)
+                foreach ($file in (Get-ChildItem -LiteralPath $logDir -File -ErrorAction Stop)) {
+                    $isAuditFile = $file.Name -match '^TuneUp_.+_\d{8}-\d{6}(?:-\d{3})?\.(?:log|json)$' -or
+                        $file.Name -match '^Ipconfig(?:Before|After)_.+_\d{8}-\d{6}(?:-\d{3})?\.txt$'
+                    if ($isAuditFile -and $file.LastWriteTime -lt $cutoff) {
+                        Remove-Item -LiteralPath $file.FullName -Force -Confirm:$false -ErrorAction Stop
+                    }
+                }
+            }
+            catch {
+                Write-Log "Old log/report pruning failed (continuing): $($_.Exception.Message)" -Level Warn
+            }
+        }
 
-    try {
-        Start-Transcript -Path $script:LogFile -Force -ErrorAction Stop | Out-Null
-        $script:TranscriptStarted = $true
-    }
-    catch {
-        Write-Log "Transcript could not be started ($($_.Exception.Message)). Continuing without it; the JSON report will still be written." -Level Warn
+        $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+        $script:LogFile = Join-Path $logDir ("TuneUp_{0}_{1}.log" -f $env:COMPUTERNAME, $timestamp)
+        $script:ReportFile = $ReportPath
+        if ([string]::IsNullOrWhiteSpace($script:ReportFile)) {
+            $script:ReportFile = Join-Path $logDir ("TuneUp_{0}_{1}.json" -f $env:COMPUTERNAME, $timestamp)
+        }
+        if ($script:QuietMode -and 'Network' -in $Phase) {
+            $script:IpconfigBeforeFile = Join-Path $logDir ("IpconfigBefore_{0}_{1}.txt" -f $env:COMPUTERNAME, $timestamp)
+            $script:IpconfigAfterFile = Join-Path $logDir ("IpconfigAfter_{0}_{1}.txt" -f $env:COMPUTERNAME, $timestamp)
+        }
+
+        try {
+            Start-Transcript -LiteralPath $script:LogFile -NoClobber -ErrorAction Stop | Out-Null
+            $script:TranscriptStarted = $true
+        }
+        catch {
+            Write-Log "Transcript could not be started ($($_.Exception.Message)). Continuing without it; the JSON report will still be written." -Level Warn
+        }
     }
 
     # ---------------------------------------------------------------- header ---
@@ -539,7 +566,7 @@ try {
     Write-Log " Free C:  : $(Format-FreeSpaceGB -Gigabytes $freeBefore)"
     Write-Log " Log file : $($script:LogFile)"
     Write-Log '=============================================================='
-    if (-not $SkipAdapterRestart) {
+    if ('Network' -in $Phase -and -not $SkipAdapterRestart) {
         Write-Log 'NOTE: the adapter restart / DHCP renew steps near the end of the'
         Write-Log 'network phase will briefly drop the remote session. The script'
         Write-Log 'keeps running locally; the remote-support tool should reconnect on its own.' -Level Warn
@@ -551,14 +578,15 @@ try {
     Write-Log '--- PHASE 1: NETWORK RESET & REPAIR ---'
 
     Invoke-Step 'Capture network state (before)' -ReadOnly {
-        if ($script:QuietMode) {
+        if ($script:IpconfigBeforeFile) {
             ipconfig.exe /all | Out-File -FilePath $script:IpconfigBeforeFile -Encoding utf8
             if ($LASTEXITCODE -ne 0) { throw "ipconfig /all exited with code $LASTEXITCODE" }
         }
-        else {
+        elseif (-not $script:QuietMode) {
             ipconfig.exe /all | Out-Host
             if ($LASTEXITCODE -ne 0) { throw "ipconfig /all exited with code $LASTEXITCODE" }
         }
+        else { ipconfig.exe /all | Out-Null }
     }
 
     Invoke-Step 'Flush DNS resolver cache' -Target 'DNS resolver cache' -Operation 'Flush DNS cache' {
@@ -616,8 +644,8 @@ try {
         }
         Invoke-Step 'Reset TCP/IP stack - IPv4 and IPv6 (applies after reboot)' -Target 'TCP/IP stack' -Operation 'Reset TCP/IP stack' {
             Invoke-NativeCommand -Command 'netsh.exe' -Arguments @('int', 'ip', 'reset') -SuppressOutput:$script:QuietMode | Out-Null
-            Invoke-NativeCommand -Command 'netsh.exe' -Arguments @('int', 'ipv6', 'reset') -SuppressOutput:$script:QuietMode | Out-Null
             $script:RebootNeeded = $true
+            Invoke-NativeCommand -Command 'netsh.exe' -Arguments @('int', 'ipv6', 'reset') -SuppressOutput:$script:QuietMode | Out-Null
         }
     }
 
@@ -677,14 +705,15 @@ try {
     }
 
     Invoke-Step 'Capture network state (after)' -ReadOnly {
-        if ($script:QuietMode) {
+        if ($script:IpconfigAfterFile) {
             ipconfig.exe /all | Out-File -FilePath $script:IpconfigAfterFile -Encoding utf8
             if ($LASTEXITCODE -ne 0) { throw "ipconfig /all exited with code $LASTEXITCODE" }
         }
-        else {
+        elseif (-not $script:QuietMode) {
             ipconfig.exe /all | Out-Host
             if ($LASTEXITCODE -ne 0) { throw "ipconfig /all exited with code $LASTEXITCODE" }
         }
+        else { ipconfig.exe /all | Out-Null }
     }
 
     # ============================================================ CLEANUP ===
@@ -692,41 +721,30 @@ try {
     Write-Log ''
     Write-Log '--- PHASE 2: DISK & SYSTEM CLEANUP ---'
 
-    Invoke-Step 'Clear temp folders (all profiles + Windows; in-use files skipped)' -Target 'Temp folders' -Operation 'Clear temp folders' {
-        $tempTargets = @("$env:SystemRoot\Temp")
-        $tempTargets += Get-ChildItem "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue |
-            ForEach-Object { Join-Path $_.FullName 'AppData\Local\Temp' } |
-            Where-Object { Test-Path $_ }
-        foreach ($t in $tempTargets) {
-            # SilentlyContinue is deliberate here: in-use files cannot be
-            # deleted while a process holds them, and that is expected.
-            $foundCount = (Get-ChildItem -LiteralPath $t -Force -ErrorAction SilentlyContinue | Measure-Object).Count
-            Get-ChildItem -LiteralPath $t -Force -ErrorAction SilentlyContinue |
-                Remove-Item -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Log "    processed: $t ($foundCount item(s) found; in-use files skipped)"
+    $tempStep = 'Clear temp folders (all profiles + Windows; in-use files skipped)'
+    if ($SkipTempCleanup) {
+        Add-SkippedStep -Name $tempStep -Reason 'Skipped via -SkipTempCleanup'
+    }
+    else {
+        Invoke-Step $tempStep -Target 'Temp folders' -Operation 'Clear temp folders' {
+            $tempTargets = @("$env:SystemRoot\Temp")
+            $tempTargets += Get-ChildItem -LiteralPath "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object { Join-Path $_.FullName 'AppData\Local\Temp' } |
+                Where-Object { Test-Path -LiteralPath $_ -PathType Container }
+            foreach ($target in $tempTargets) {
+                $items = @(Get-ChildItem -LiteralPath $target -Force -ErrorAction SilentlyContinue)
+                foreach ($item in $items) {
+                    Remove-Item -LiteralPath $item.FullName -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
+                }
+                Write-Log "    processed: $target ($($items.Count) item(s) found; in-use files skipped)"
+            }
         }
     }
 
     if ($ClearRecycleBin) {
-        $recycleBinConfirmed = $false
-        if ($script:NonInteractiveMode -and -not $script:ForceMode) {
-            Write-Log 'Skipping Recycle Bin emptying in non-interactive mode without -Force.' -Level Warn
-            Add-SkippedStep -Name 'Empty Recycle Bin' -Reason 'Skipped in non-interactive mode without -Force'
-        }
-        elseif ((Test-IsInteractive) -and -not $script:ForceMode) {
-            $recycleBinConfirmed = Confirm-UserChoice -Message 'Empty the Recycle Bin now? This deletes files the user may still expect to recover.'
-            if (-not $recycleBinConfirmed) {
-                Write-Log 'Skipping Recycle Bin emptying (not confirmed).' -Level Warn
-                Add-SkippedStep -Name 'Empty Recycle Bin' -Reason 'Not confirmed by user'
-            }
-        }
-        else {
-            $recycleBinConfirmed = $true
-        }
-        if ($recycleBinConfirmed) {
-            Invoke-Step 'Empty Recycle Bin' -Target 'Recycle Bin' -Operation 'Empty Recycle Bin' {
-                Clear-RecycleBin -Force -ErrorAction Stop
-            }
+        Invoke-Step 'Empty Recycle Bin' -Target 'Recycle Bin' -Operation 'Empty Recycle Bin' `
+            -Prompt 'Empty the Recycle Bin now? This deletes files the user may still expect to recover.' {
+            Clear-RecycleBin -Force -Confirm:$false -ErrorAction Stop
         }
     }
 
@@ -807,17 +825,15 @@ try {
     $freeAfter = Get-FreeSpaceGB
     $stopwatch.Stop()
 
-    Write-Summary -FreeBefore $freeBefore -FreeAfter $freeAfter
-
     if ($Reboot) {
         Invoke-Step 'Reboot (shutdown /r)' -Target 'Computer' -Operation 'Restart computer' {
             Invoke-NativeCommand -Command 'shutdown.exe' -Arguments @('/r', '/t', "$RebootDelaySeconds", '/c', 'IT maintenance is complete. This PC will restart shortly - please save your work.') | Out-Null
         }
     }
     elseif ($script:RebootNeeded) {
-        Write-Log 'A REBOOT IS REQUIRED for the network stack reset to take effect.' -Level Warn
-        Write-Log 'Re-run with -Reboot to restart automatically, or restart manually.' -Level Warn
+        Write-Log 'A REBOOT IS REQUIRED to finish pending system changes.' -Level Warn
     }
+    Write-Summary -FreeBefore $freeBefore -FreeAfter $freeAfter
 }
 catch {
     $script:FatalError = $_.Exception.Message
@@ -836,6 +852,8 @@ finally {
         PowerShell      = $PSVersionTable.PSVersion.ToString()
         PSEdition       = $PSVersionTable.PSEdition
         Parameters      = [ordered]@{
+            Phase              = $Phase
+            SkipTempCleanup    = [bool]$SkipTempCleanup
             SkipStackReset     = [bool]$SkipStackReset
             SkipAdapterRestart = [bool]$SkipAdapterRestart
             ClearRecycleBin    = [bool]$ClearRecycleBin
@@ -867,7 +885,7 @@ finally {
     if ($null -ne $script:ReportFile) {
         try {
             $report | ConvertTo-Json -Depth 4 -ErrorAction Stop |
-                Set-Content -Path $script:ReportFile -Encoding utf8 -ErrorAction Stop
+                Set-Content -LiteralPath $script:ReportFile -Encoding utf8 -Confirm:$false -ErrorAction Stop
             Write-Log "Report saved to: $($script:ReportFile)"
         }
         catch {
