@@ -117,6 +117,12 @@ Without a config file, the built-in TCP probe checks `8.8.8.8:53`. Use an empty 
 
 The JSON export includes the same findings shown in the ticket summary.
 
+VPN results distinguish a running client from an active tunnel interface. Cisco and Zscaler evidence is matched to each provider's adapter. The JSON includes the observed tunnel addresses and inspection errors.
+
+For a target diagnostic, TCP checks try resolved IPv4 and IPv6 addresses within the configured time budget. Each port and infrastructure check records its tested address and Windows route. The gateway and DNS-server latency checks use the route for the first successful target port, or the first port result when all ports fail. A run without a target selects the connected default route with the lowest combined route and interface metric, preferring IPv4 and falling back to IPv6.
+
+DNS-server latency uses the selected interface's DNS configuration. Timed name resolution uses Windows resolver policy. All discovered DNS servers and gateways remain in the JSON inventory.
+
 ---
 
 ## Compare-NetTriage.ps1
@@ -163,6 +169,9 @@ powershell.exe -File .\Invoke-EndpointTuneUp.ps1 -DeepClean -Reboot
 # Fragile connection: keep the session alive, skip reboot-dependent resets
 powershell.exe -File .\Invoke-EndpointTuneUp.ps1 -SkipAdapterRestart -SkipStackReset
 
+# Remote support with network-disrupting steps protected
+powershell.exe -File .\Invoke-EndpointTuneUp.ps1 -Phase Network -RemoteSafe
+
 # Preview component-store cleanup and SFC
 powershell.exe -File .\Invoke-EndpointTuneUp.ps1 -Phase Cleanup -DeepClean -SkipTempCleanup -WhatIf
 ```
@@ -170,6 +179,7 @@ powershell.exe -File .\Invoke-EndpointTuneUp.ps1 -Phase Cleanup -DeepClean -Skip
 | Parameter | Default | Notes |
 |---|---|---|
 | `-Phase` | Network, Cleanup, Optimize | Select one or more maintenance phases |
+| `-RemoteSafe` | off | Keep DNS flush, registration, and snapshots available while protecting disruptive network changes, policy triggers, and automatic reboot |
 | `-SkipTempCleanup` | off | Skip deletion of temporary files |
 | `-WhatIf` | off | Preview maintenance steps without writing logs or changing the clipboard |
 | `-SkipStackReset` | off | Skip Winsock/TCP-IP reset — use on static-IP machines |
@@ -180,6 +190,10 @@ powershell.exe -File .\Invoke-EndpointTuneUp.ps1 -Phase Cleanup -DeepClean -Skip
 | `-RebootDelaySeconds` | 60 | Countdown before auto-reboot |
 
 The transcript and JSON step report default to `C:\ProgramData\EndpointTuneUp\Logs`.
+
+The IP preflight detects manually configured IPv4 and IPv6 addresses. Manual addresses or an unavailable IP inspection cause stack-reset steps to be skipped. The JSON report records the preflight result and the detected static addresses.
+
+`-RemoteSafe` also skips ARP and NetBIOS purges, TCP tuning, NIC power changes, adapter restarts, DHCP release/renew, Group Policy and SCCM triggers, and a requested reboot. These decisions are recorded as skipped steps, including when `-Force` is supplied.
 
 ---
 

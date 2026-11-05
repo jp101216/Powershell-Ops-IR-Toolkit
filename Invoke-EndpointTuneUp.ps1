@@ -98,6 +98,11 @@
     Run one or more of Network, Cleanup, and Optimize, in that order.
     Defaults to all three phases. Omitted steps appear as skipped in the report.
 
+.PARAMETER RemoteSafe
+    Skip network-disrupting changes, policy triggers, and automatic reboot
+    during remote support. DNS flush and registration remain available.
+    Skipped operations and their reasons are included in the JSON report.
+
 .PARAMETER SkipTempCleanup
     Skip temp folder cleanup. Combine with -Phase Cleanup -DeepClean to run
     DISM and SFC without clearing temp folders.
@@ -192,6 +197,7 @@
 param(
     [ValidateSet('Network', 'Cleanup', 'Optimize')]
     [string[]]$Phase = @('Network', 'Cleanup', 'Optimize'),
+    [switch]$RemoteSafe,
     [switch]$SkipTempCleanup,
     [switch]$SkipStackReset,
     [switch]$SkipAdapterRestart,
@@ -224,6 +230,7 @@ $script:CurrentPhase = 'Setup'
 $script:QuietMode = [bool]$Quiet
 $script:NonInteractiveMode = [bool]$NonInteractive
 $script:ForceMode = [bool]$Force
+$script:NetworkSafety = [pscustomobject]@{ State = 'NotRequested'; StaticAddresses = @(); Error = $null }
 $script:StepFailures = New-Object System.Collections.Generic.List[string]
 $script:SkippedSteps = New-Object System.Collections.Generic.List[string]
 $script:StepResults = New-Object System.Collections.Generic.List[object]
@@ -289,6 +296,25 @@ function Add-SkippedStep {
     }) | Out-Null
 }
 
+function Get-NetworkResetSafety {
+    $safety = [pscustomobject]@{ State = 'Unknown'; StaticAddresses = @(); Error = $null }
+    try {
+        $addresses = @(Get-NetIPAddress -Type Unicast -ErrorAction Stop | Where-Object {
+            $parsed = $null
+            [System.Net.IPAddress]::TryParse($_.IPAddress, [ref]$parsed) -and
+            -not [System.Net.IPAddress]::IsLoopback($parsed)
+        })
+        $safety.StaticAddresses = @($addresses | Where-Object { $_.PrefixOrigin -eq 'Manual' } |
+            Select-Object InterfaceIndex, InterfaceAlias, IPAddress, AddressFamily)
+        if ($safety.StaticAddresses.Count -gt 0) { $safety.State = 'StaticDetected' }
+        elseif ($addresses.Count -gt 0 -and @($addresses | Where-Object {
+            [string]$_.PrefixOrigin -notin @('Dhcp', 'RouterAdvertisement', 'WellKnown', 'Other')
+        }).Count -eq 0) { $safety.State = 'NoManualAddresses' }
+    }
+    catch { $safety.Error = $_.Exception.Message }
+    return $safety
+}
+
 function Invoke-NativeCommand {
     param(
         [Parameter(Mandatory = $true)][string]$Command,
@@ -325,10 +351,20 @@ function Invoke-Step {
         [switch]$ReadOnly,
         [string]$Target,
         [string]$Operation,
-        [string]$Prompt
+        [string]$Prompt,
+        [switch]$DisruptsNetwork,
+        [switch]$ResetsNetworkStack
     )
     if ($script:CurrentPhase -ne 'Summary' -and $Phase -notcontains $script:CurrentPhase) {
         Add-SkippedStep -Name $Name -Reason "Phase excluded by -Phase ($($script:CurrentPhase))"
+        return
+    }
+    if ($RemoteSafe -and $DisruptsNetwork) {
+        Add-SkippedStep -Name $Name -Reason 'Skipped by -RemoteSafe'
+        return
+    }
+    if ($ResetsNetworkStack -and $script:NetworkSafety.State -ne 'NoManualAddresses') {
+        Add-SkippedStep -Name $Name -Reason "Stack reset protected by IP configuration check ($($script:NetworkSafety.State))"
         return
     }
     if (-not $ReadOnly) {
@@ -432,6 +468,8 @@ function Write-Summary {
             "Completed : $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
             "User      : $env:USERDOMAIN\$env:USERNAME"
             "OS        : $osText"
+            "Remote safe    : $([bool]$RemoteSafe)"
+            "IP reset check : $($script:NetworkSafety.State)"
             "Elapsed   : $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))"
             "Free C: before : $(Format-FreeSpaceGB -Gigabytes $FreeBefore)"
             "Free C: after  : $(Format-FreeSpaceGB -Gigabytes $FreeAfter)"
@@ -453,6 +491,8 @@ function Write-Summary {
     Write-Log ''
     Write-Log '=============================================================='
     Write-Log ' SUMMARY'
+    Write-Log " Remote safe    : $([bool]$RemoteSafe)"
+    Write-Log " IP reset check : $($script:NetworkSafety.State)"
     Write-Log (" Elapsed        : {0:hh\:mm\:ss} (hh:mm:ss)" -f $stopwatch.Elapsed)
     Write-Log " Free C: before : $(Format-FreeSpaceGB -Gigabytes $FreeBefore)"
     Write-Log " Free C: after  : $(Format-FreeSpaceGB -Gigabytes $FreeAfter)"
@@ -552,6 +592,12 @@ try {
 
     # ---------------------------------------------------------------- header ---
     $script:OsInfo = Get-OperatingSystemInfo
+    if ('Network' -in $Phase) {
+        $script:NetworkSafety = Get-NetworkResetSafety
+        if ($script:NetworkSafety.State -ne 'NoManualAddresses') {
+            Write-Log "Stack resets are protected by IP configuration check ($($script:NetworkSafety.State))." -Level Warn
+        }
+    }
     $freeBefore = Get-FreeSpaceGB
     $osHeader = 'unknown'
     if ($null -ne $script:OsInfo) { $osHeader = "$($script:OsInfo.Caption) $($script:OsInfo.Version)" }
@@ -564,7 +610,7 @@ try {
     Write-Log " Free C:  : $(Format-FreeSpaceGB -Gigabytes $freeBefore)"
     Write-Log " Log file : $($script:LogFile)"
     Write-Log '=============================================================='
-    if ('Network' -in $Phase -and -not $SkipAdapterRestart) {
+    if ('Network' -in $Phase -and -not $SkipAdapterRestart -and -not $RemoteSafe) {
         Write-Log 'NOTE: the adapter restart / DHCP renew steps near the end of the'
         Write-Log 'network phase will briefly drop the remote session. The script'
         Write-Log 'keeps running locally; the remote-support tool should reconnect on its own.' -Level Warn
@@ -595,22 +641,22 @@ try {
         Invoke-NativeCommand -Command 'ipconfig.exe' -Arguments @('/registerdns') -SuppressOutput | Out-Null
     }
 
-    Invoke-Step 'Purge ARP/neighbor cache' -Target 'ARP cache' -Operation 'Purge ARP cache' {
+    Invoke-Step 'Purge ARP/neighbor cache' -DisruptsNetwork -Target 'ARP cache' -Operation 'Purge ARP cache' {
         Invoke-NativeCommand -Command 'netsh.exe' -Arguments @('interface', 'ip', 'delete', 'arpcache') -SuppressOutput | Out-Null
     }
 
-    Invoke-Step 'Purge and reload NetBIOS name cache' -Target 'NetBIOS name cache' -Operation 'Purge and reload NetBIOS cache' {
+    Invoke-Step 'Purge and reload NetBIOS name cache' -DisruptsNetwork -Target 'NetBIOS name cache' -Operation 'Purge and reload NetBIOS cache' {
         # NetBIOS is disabled on many modern hosts, so a non-zero exit here
         # is a warning, not a step failure.
         Invoke-NativeCommand -Command 'nbtstat.exe' -Arguments @('-R') -SuppressOutput -WarnOnNonZero | Out-Null
         Invoke-NativeCommand -Command 'nbtstat.exe' -Arguments @('-RR') -SuppressOutput -WarnOnNonZero | Out-Null
     }
 
-    Invoke-Step 'Set TCP receive autotuning to normal' -Target 'TCP autotuning' -Operation 'Set TCP autotuning to normal' {
+    Invoke-Step 'Set TCP receive autotuning to normal' -DisruptsNetwork -Target 'TCP autotuning' -Operation 'Set TCP autotuning to normal' {
         Invoke-NativeCommand -Command 'netsh.exe' -Arguments @('int', 'tcp', 'set', 'global', 'autotuninglevel=normal') -SuppressOutput | Out-Null
     }
 
-    Invoke-Step 'Disable power-saving on physical network adapters' -Target 'NIC power-saving' -Operation 'Disable NIC power-saving' {
+    Invoke-Step 'Disable power-saving on physical network adapters' -DisruptsNetwork -Target 'NIC power-saving' -Operation 'Disable NIC power-saving' {
         Get-NetAdapter -Physical -ErrorAction Stop | ForEach-Object {
             $adapterName = $_.Name
             # SilentlyContinue is deliberate here: adapters without power
@@ -636,11 +682,11 @@ try {
         Add-SkippedStep -Name 'Reset TCP/IP stack - IPv4 and IPv6 (applies after reboot)' -Reason 'Skipped via -SkipStackReset'
     }
     else {
-        Invoke-Step 'Reset Winsock catalog (applies after reboot)' -Target 'Winsock catalog' -Operation 'Reset Winsock catalog' {
+        Invoke-Step 'Reset Winsock catalog (applies after reboot)' -DisruptsNetwork -ResetsNetworkStack -Target 'Winsock catalog' -Operation 'Reset Winsock catalog' {
             Invoke-NativeCommand -Command 'netsh.exe' -Arguments @('winsock', 'reset') -SuppressOutput:$script:QuietMode | Out-Null
             $script:RebootNeeded = $true
         }
-        Invoke-Step 'Reset TCP/IP stack - IPv4 and IPv6 (applies after reboot)' -Target 'TCP/IP stack' -Operation 'Reset TCP/IP stack' {
+        Invoke-Step 'Reset TCP/IP stack - IPv4 and IPv6 (applies after reboot)' -DisruptsNetwork -ResetsNetworkStack -Target 'TCP/IP stack' -Operation 'Reset TCP/IP stack' {
             Invoke-NativeCommand -Command 'netsh.exe' -Arguments @('int', 'ip', 'reset') -SuppressOutput:$script:QuietMode | Out-Null
             $script:RebootNeeded = $true
             Invoke-NativeCommand -Command 'netsh.exe' -Arguments @('int', 'ipv6', 'reset') -SuppressOutput:$script:QuietMode | Out-Null
@@ -653,7 +699,7 @@ try {
         Add-SkippedStep -Name 'DHCP release/renew (session will blip)' -Reason 'Skipped via -SkipAdapterRestart'
     }
     else {
-        Invoke-Step 'Restart physical network adapters (session will blip)' -Target 'Physical network adapters' -Operation 'Restart physical network adapters' {
+        Invoke-Step 'Restart physical network adapters (session will blip)' -DisruptsNetwork -Target 'Physical network adapters' -Operation 'Restart physical network adapters' {
             $upAdapters = @(Get-NetAdapter -Physical -ErrorAction Stop |
                 Where-Object { $_.Status -eq 'Up' })
             if ($upAdapters.Count -eq 0) {
@@ -693,7 +739,7 @@ try {
             }
         }
 
-        Invoke-Step 'DHCP release/renew (session will blip)' -Target 'DHCP lease' -Operation 'DHCP release/renew' {
+        Invoke-Step 'DHCP release/renew (session will blip)' -DisruptsNetwork -Target 'DHCP lease' -Operation 'DHCP release/renew' {
             # A mixed static/DHCP machine can legitimately report
             # per-adapter errors here while succeeding overall, so a
             # non-zero exit is a warning, not a step failure.
@@ -769,11 +815,11 @@ try {
         }
     }
 
-    Invoke-Step 'Refresh Group Policy (gpupdate /force)' -Target 'Group Policy' -Operation 'Refresh Group Policy' {
+    Invoke-Step 'Refresh Group Policy (gpupdate /force)' -DisruptsNetwork -Target 'Group Policy' -Operation 'Refresh Group Policy' {
         Invoke-NativeCommand -Command 'gpupdate.exe' -Arguments @('/force') -SuppressOutput:$script:QuietMode | Out-Null
     }
 
-    Invoke-Step 'Trigger SCCM/MECM client actions (if client present)' -Target 'SCCM client' -Operation 'Trigger SCCM client schedules' {
+    Invoke-Step 'Trigger SCCM/MECM client actions (if client present)' -DisruptsNetwork -Target 'SCCM client' -Operation 'Trigger SCCM client schedules' {
         $ccmService = Get-Service -Name CcmExec -ErrorAction SilentlyContinue
         if ($null -eq $ccmService) {
             Write-Log '    SCCM client not found - skipped.'
@@ -824,7 +870,7 @@ try {
     $stopwatch.Stop()
 
     if ($Reboot) {
-        Invoke-Step 'Reboot (shutdown /r)' -Target 'Computer' -Operation 'Restart computer' {
+        Invoke-Step 'Reboot (shutdown /r)' -DisruptsNetwork -Target 'Computer' -Operation 'Restart computer' {
             Invoke-NativeCommand -Command 'shutdown.exe' -Arguments @('/r', '/t', "$RebootDelaySeconds", '/c', 'IT maintenance is complete. This PC will restart shortly - please save your work.') | Out-Null
         }
     }
@@ -851,6 +897,7 @@ finally {
         PSEdition       = $PSVersionTable.PSEdition
         Parameters      = [ordered]@{
             Phase              = $Phase
+            RemoteSafe         = [bool]$RemoteSafe
             SkipTempCleanup    = [bool]$SkipTempCleanup
             SkipStackReset     = [bool]$SkipStackReset
             SkipAdapterRestart = [bool]$SkipAdapterRestart
@@ -865,6 +912,7 @@ finally {
         }
         ElapsedSeconds  = [math]::Round($stopwatch.Elapsed.TotalSeconds, 1)
         Steps           = $script:StepResults
+        NetworkSafety   = $script:NetworkSafety
         FreeBeforeGB    = $freeBefore
         FreeAfterGB     = $freeAfter
         SpaceFreedGB    = $spaceFreed
