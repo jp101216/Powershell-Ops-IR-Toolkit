@@ -96,7 +96,7 @@
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
     Read-only. Safe to run in a user or PAM/elevated context.
-    Version 2.2
+    Version 3.0.0
     v2 RECONSTRUCTION NOTE: The repo original was truncated at exactly
     20000 bytes, ending mid-line inside Build-ServiceNowSummary. This v2
     file keeps the original code up to that truncation point, then
@@ -115,7 +115,7 @@ param (
     [ValidateRange(1, 65535)]
     [int[]] $TargetPorts        = @(443, 80, 445, 3389),
 
-    [string]$ExportPath         = "$env:LOCALAPPDATA\NetTriage\Triage_$((Get-Date).ToString('yyyyMMdd_HHmmss_fff')).json",
+    [string]$ExportPath         = "$env:LOCALAPPDATA\NetTriage\Triage_$((Get-Date).ToString('yyyyMMdd_HHmmss_fff'))_$([guid]::NewGuid().ToString('N').Substring(0,8)).json",
     [ValidateRange(1, 20)]
     [int]   $PingCount          = 4,
     [ValidateRange(1, 60000)]
@@ -156,6 +156,7 @@ $Thresholds = @{
 
 # Findings collector (populated in the analysis pass, surfaced in both views)
 $Findings = New-Object System.Collections.Generic.List[object]
+$CollectionErrors = New-Object System.Collections.Generic.List[object]
 
 # --------------------------------------------------------------------------
 # CORE INFRASTRUCTURE  (organization reachability targets)
@@ -168,7 +169,7 @@ if (-not $CoreInfrastructurePath) {
     }
 }
 if ($CoreInfrastructurePath) {
-    $configJson = Get-Content -LiteralPath $CoreInfrastructurePath -Raw -ErrorAction Stop
+    $configJson = Get-Content -LiteralPath $CoreInfrastructurePath -Raw -Encoding UTF8 -ErrorAction Stop
     if ([string]::IsNullOrWhiteSpace($configJson) -or -not $configJson.TrimStart().StartsWith('[')) {
         throw "Infrastructure config '$CoreInfrastructurePath' must contain a JSON array."
     }
@@ -241,18 +242,94 @@ function Get-SeverityRank {
 function Get-MetricColor {
     <# Convenience: value + thresholds -> console color (single source of logic). #>
     param(
-        [double]$Value,
+        [AllowNull()]$Value,
         [double]$Warn,
         [double]$Crit,
         [switch]$LowerIsWorse
     )
+    if ($null -eq $Value) { return [ConsoleColor]::Yellow }
     Get-SeverityColor (Get-Severity -Value $Value -Warn $Warn -Crit $Crit -LowerIsWorse:$LowerIsWorse)
+}
+
+function Format-Measurement {
+    param([AllowNull()]$Value, [string]$Suffix)
+    if ($null -eq $Value) { return 'Unknown' }
+    return "$Value$Suffix"
 }
 
 function Add-Finding {
     <# Record a flagged metric for the KEY FINDINGS section. #>
     param([string]$Sev, [string]$Msg)
     $Findings.Add([pscustomobject]@{ Severity = $Sev; Message = $Msg })
+}
+
+function Add-CollectionError {
+    param([string]$Collector, [string]$Message)
+    $CollectionErrors.Add([pscustomobject]@{ Collector = $Collector; Message = $Message }) | Out-Null
+    Add-Finding 'Warn' "$Collector unavailable - $Message"
+}
+
+function Write-TriageExportPair {
+    param([string]$JsonPath, [string]$TextPath, $Data, [string]$Summary)
+    $directory = Split-Path -Parent $JsonPath
+    [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    $token = [guid]::NewGuid().ToString('N')
+    $jsonTemp = Join-Path $directory ($token + '.json.tmp')
+    $textTemp = Join-Path $directory ($token + '.txt.tmp')
+    $jsonBackup = Join-Path $directory ($token + '.json.bak')
+    $textBackup = Join-Path $directory ($token + '.txt.bak')
+    $lock = $null
+    $published = $false
+    $committed = $false
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        while ($null -eq $lock) {
+            try {
+                $lock = [System.IO.FileStream]::new($JsonPath + '.lock', [System.IO.FileMode]::OpenOrCreate,
+                    [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::DeleteOnClose)
+            }
+            catch [System.IO.IOException] {
+                if ($clock.Elapsed.TotalSeconds -ge 5) { throw 'Another process is writing this report pair.' }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+        if ((Test-Path -LiteralPath $JsonPath -PathType Container) -or (Test-Path -LiteralPath $TextPath -PathType Container)) {
+            throw 'Report destinations must be file paths.'
+        }
+        $Data | ConvertTo-Json -Depth 8 -ErrorAction Stop |
+            Set-Content -LiteralPath $jsonTemp -Encoding UTF8 -ErrorAction Stop
+        $Summary | Set-Content -LiteralPath $textTemp -Encoding UTF8 -ErrorAction Stop
+        if ([System.IO.File]::Exists($JsonPath)) { [System.IO.File]::Replace($jsonTemp, $JsonPath, $jsonBackup) }
+        else { [System.IO.File]::Move($jsonTemp, $JsonPath) }
+        $published = $true
+        if ([System.IO.File]::Exists($TextPath)) { [System.IO.File]::Replace($textTemp, $TextPath, $textBackup) }
+        else { [System.IO.File]::Move($textTemp, $TextPath) }
+        $committed = $true
+    }
+    catch {
+        $publicationError = $_
+        try {
+            if ([System.IO.File]::Exists($jsonBackup)) {
+                [System.IO.File]::Replace($jsonBackup, $JsonPath, [NullString]::Value)
+            }
+            elseif ($published) { [System.IO.File]::Delete($JsonPath) }
+            if ([System.IO.File]::Exists($textBackup)) {
+                [System.IO.File]::Replace($textBackup, $TextPath, [NullString]::Value)
+            }
+        }
+        catch { throw "Report recovery failed. Backup files were preserved in '$directory'. $($_.Exception.Message)" }
+        throw $publicationError
+    }
+    finally {
+        try {
+            $cleanupPaths = @($jsonTemp, $textTemp)
+            if ($committed) { $cleanupPaths += @($jsonBackup, $textBackup) }
+            foreach ($path in $cleanupPaths) {
+                if ([System.IO.File]::Exists($path)) { [System.IO.File]::Delete($path) }
+            }
+        }
+        finally { if ($null -ne $lock) { $lock.Dispose() } }
+    }
 }
 
 function Write-Field {
@@ -396,12 +473,12 @@ function Get-PendingReboot {
         if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
             $reasons += 'Windows Update'
         }
-        $pfro = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
-                    -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
-        if ($pfro) { $reasons += 'Pending file rename' }
+        $session = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction Stop
+        $pfro = $session.PSObject.Properties['PendingFileRenameOperations']
+        if ($null -ne $pfro -and $pfro.Value) { $reasons += 'Pending file rename' }
     }
-    catch { }
-    return [ordered]@{ Pending = ($reasons.Count -gt 0); Reasons = ($reasons -join ', ') }
+    catch { return [ordered]@{ Pending = $null; Reasons = 'Inspection unavailable'; Error = $_.Exception.Message } }
+    return [ordered]@{ Pending = ($reasons.Count -gt 0); Reasons = ($reasons -join ', '); Error = $null }
 }
 
 function Resolve-DiagnosticTarget {
@@ -670,7 +747,7 @@ function Remove-OldTriageExports {
     if ($Keep -le 0 -or -not $Directory) { return }
     try {
         $files = @(Get-ChildItem -LiteralPath $Directory -Filter 'Triage_*.json' -File -ErrorAction Stop |
-                 Where-Object { $_.Name -match '^Triage_\d{8}_\d{6}(?:_\d{3})?\.json$' } |
+                 Where-Object { $_.Name -match '^Triage_\d{8}_\d{6}(?:_\d{3}(?:_[0-9a-f]{8})?)?\.json$' } |
                  Sort-Object LastWriteTime -Descending)
         $current = @( $files | Where-Object { $_.FullName -eq $CurrentPath } )
         $older = $files | Where-Object { $_.FullName -ne $CurrentPath } | Select-Object -Skip ($Keep - $current.Count)
@@ -708,20 +785,23 @@ function Build-ServiceNowSummary {
     $L.Add('')
 
     # ---- System ----
+    $L.Add("Collection  $($Data.CollectionStatus)")
     $L.Add('SYSTEM')
     $L.Add(("  Logged-on User: {0}" -f $(if ($Data.System.LoggedOnUser) { $Data.System.LoggedOnUser } else { 'None / not detected' })))
     $L.Add(("  Computer      : {0}  ({1})" -f $Data.System.Hostname, $Data.System.Model))
     $L.Add(("  OS            : {0} (build {1})" -f $Data.System.OS, $Data.System.OSBuild))
-    $L.Add(("  Uptime        : {0} days" -f $Data.System.Uptime_Days))
-    $L.Add(("  Pending Reboot: {0}" -f $(if ($Data.System.PendingReboot) { "Yes - $($Data.System.RebootReasons)" } else { 'No' })))
+    $L.Add(("  Uptime        : {0}" -f (Format-Measurement $Data.System.Uptime_Days ' days')))
+    $L.Add(("  Pending Reboot: {0}" -f $(if ($null -eq $Data.System.PendingReboot) { 'Unknown' } elseif ($Data.System.PendingReboot) { "Yes - $($Data.System.RebootReasons)" } else { 'No' })))
     $L.Add('')
 
     # ---- Performance ----
     $p = $Data.Performance
     $L.Add('PERFORMANCE')
-    $L.Add(("  CPU Load      : {0}%" -f $p.CPU_LoadPct))
-    $L.Add(("  Memory        : {0}% used ({1} GB free of {2} GB)" -f $p.Memory_UsedPct, $p.Memory_FreeGB, $p.Memory_TotalGB))
-    $L.Add(("  Disk {0} free   : {1}% ({2} GB free of {3} GB)" -f $p.Disk, $p.Disk_FreePct, $p.Disk_FreeGB, $p.Disk_SizeGB))
+    $L.Add(("  CPU Load      : {0}" -f (Format-Measurement $p.CPU_LoadPct '%')))
+    if ($null -eq $p.Memory_UsedPct) { $L.Add('  Memory        : Unknown') }
+    else { $L.Add(("  Memory        : {0}% used ({1} GB free of {2} GB)" -f $p.Memory_UsedPct, $p.Memory_FreeGB, $p.Memory_TotalGB)) }
+    if ($null -eq $p.Disk_FreePct) { $L.Add(("  Disk {0} free   : Unknown" -f $p.Disk)) }
+    else { $L.Add(("  Disk {0} free   : {1}% ({2} GB free of {3} GB)" -f $p.Disk, $p.Disk_FreePct, $p.Disk_FreeGB, $p.Disk_SizeGB)) }
     if ($null -ne $p.Disk_LatencyMs) { $L.Add(("  Disk Latency  : {0} ms avg (queue {1})" -f $p.Disk_LatencyMs, $p.Disk_QueueLength)) }
     if ($p.TopCPU.Count)    { $L.Add(("  Top CPU       : {0}" -f ($p.TopCPU -join ', '))) }
     if ($p.TopMemory.Count) { $L.Add(("  Top Memory    : {0}" -f ($p.TopMemory -join ', '))) }
@@ -878,20 +958,23 @@ function Show-Dashboard {
     Write-Field 'Logged-on User' $Data.System.LoggedOnUser
     Write-Field 'Computer' ("{0} ({1})" -f $Data.System.Hostname, $Data.System.Model)
     Write-Field 'OS' ("{0} (build {1})" -f $Data.System.OS, $Data.System.OSBuild)
-    $uptimeSev = Get-Severity -Value $Data.System.Uptime_Days -Warn $Thresholds.UptimeDays.Warn -Crit $Thresholds.UptimeDays.Crit
-    Write-Field 'Uptime' ("{0} days" -f $Data.System.Uptime_Days) (Get-SeverityColor $uptimeSev)
+    Write-Field 'Uptime' (Format-Measurement $Data.System.Uptime_Days ' days') (Get-MetricColor -Value $Data.System.Uptime_Days -Warn $Thresholds.UptimeDays.Warn -Crit $Thresholds.UptimeDays.Crit)
     $rebootText = 'No'
+    if ($null -eq $Data.System.PendingReboot) { $rebootText = 'Unknown' }
     if ($Data.System.PendingReboot) { $rebootText = "Yes - $($Data.System.RebootReasons)" }
     $rebootColor = [ConsoleColor]::Green
+    if ($null -eq $Data.System.PendingReboot) { $rebootColor = [ConsoleColor]::Yellow }
     if ($Data.System.PendingReboot) { $rebootColor = [ConsoleColor]::Yellow }
     Write-Field 'Pending Reboot' $rebootText $rebootColor
     Write-Host ''
 
     $perf = $Data.Performance
     Write-Host 'PERFORMANCE' -ForegroundColor White
-    Write-Field 'CPU Load' ("{0}%" -f $perf.CPU_LoadPct) (Get-MetricColor -Value $perf.CPU_LoadPct -Warn $Thresholds.CpuPct.Warn -Crit $Thresholds.CpuPct.Crit)
-    Write-Field 'Memory' ("{0}% used ({1} GB free of {2} GB)" -f $perf.Memory_UsedPct, $perf.Memory_FreeGB, $perf.Memory_TotalGB) (Get-MetricColor -Value $perf.Memory_UsedPct -Warn $Thresholds.MemPct.Warn -Crit $Thresholds.MemPct.Crit)
-    Write-Field ("Disk {0}" -f $perf.Disk) ("{0}% free ({1} GB free of {2} GB)" -f $perf.Disk_FreePct, $perf.Disk_FreeGB, $perf.Disk_SizeGB) (Get-MetricColor -Value $perf.Disk_FreePct -Warn $Thresholds.DiskFreePct.Warn -Crit $Thresholds.DiskFreePct.Crit -LowerIsWorse)
+    Write-Field 'CPU Load' (Format-Measurement $perf.CPU_LoadPct '%') (Get-MetricColor -Value $perf.CPU_LoadPct -Warn $Thresholds.CpuPct.Warn -Crit $Thresholds.CpuPct.Crit)
+    if ($null -eq $perf.Memory_UsedPct) { Write-Field 'Memory' 'Unknown' Yellow }
+    else { Write-Field 'Memory' ("{0}% used ({1} GB free of {2} GB)" -f $perf.Memory_UsedPct, $perf.Memory_FreeGB, $perf.Memory_TotalGB) (Get-MetricColor -Value $perf.Memory_UsedPct -Warn $Thresholds.MemPct.Warn -Crit $Thresholds.MemPct.Crit) }
+    if ($null -eq $perf.Disk_FreePct) { Write-Field ("Disk {0}" -f $perf.Disk) 'Unknown' Yellow }
+    else { Write-Field ("Disk {0}" -f $perf.Disk) ("{0}% free ({1} GB free of {2} GB)" -f $perf.Disk_FreePct, $perf.Disk_FreeGB, $perf.Disk_SizeGB) (Get-MetricColor -Value $perf.Disk_FreePct -Warn $Thresholds.DiskFreePct.Warn -Crit $Thresholds.DiskFreePct.Crit -LowerIsWorse) }
     if ($null -ne $perf.Disk_LatencyMs) {
         Write-Field 'Disk Latency' ("{0} ms avg (queue {1})" -f $perf.Disk_LatencyMs, $perf.Disk_QueueLength) (Get-MetricColor -Value $perf.Disk_LatencyMs -Warn $Thresholds.DiskLatencyMs.Warn -Crit $Thresholds.DiskLatencyMs.Crit)
     }
@@ -1004,6 +1087,9 @@ if ([string]::IsNullOrWhiteSpace($TargetDestination)) {
 }
 
 $Data = [ordered]@{
+    ToolVersion  = '3.0.0'
+    CollectionStatus = 'Complete'
+    CollectionErrors = @()
     CollectedUtc = (Get-Date).ToUniversalTime().ToString('o')
     Computer     = $env:COMPUTERNAME
     System       = [ordered]@{
@@ -1012,19 +1098,19 @@ $Data = [ordered]@{
         Model         = $null
         OS            = $null
         OSBuild       = $null
-        Uptime_Days   = 0
-        PendingReboot = $false
+        Uptime_Days   = $null
+        PendingReboot = $null
         RebootReasons = ''
     }
     Performance  = [ordered]@{
-        CPU_LoadPct    = 0
-        Memory_UsedPct = 0
-        Memory_FreeGB  = 0
-        Memory_TotalGB = 0
+        CPU_LoadPct    = $null
+        Memory_UsedPct = $null
+        Memory_FreeGB  = $null
+        Memory_TotalGB = $null
         Disk           = 'C:'
-        Disk_FreePct   = 0
-        Disk_FreeGB    = 0
-        Disk_SizeGB    = 0
+        Disk_FreePct   = $null
+        Disk_FreeGB    = $null
+        Disk_SizeGB    = $null
         Disk_LatencyMs = $null
         Disk_QueueLength = $null
         TopCPU         = @()
@@ -1072,12 +1158,14 @@ try {
     if ($osInfo.LastBootUpTime) {
         $Data.System.Uptime_Days = [math]::Round(((Get-Date) - $osInfo.LastBootUpTime).TotalDays, 1)
     }
+    else { Add-CollectionError 'Uptime' 'The operating-system provider returned no boot timestamp.' }
     $pending = Get-PendingReboot
     $Data.System.PendingReboot = $pending.Pending
     $Data.System.RebootReasons = $pending.Reasons
+    if ($pending.Error) { Add-CollectionError 'Reboot status' $pending.Error }
 }
 catch {
-    Write-Warning "System baseline collection failed: $($_.Exception.Message)"
+    Add-CollectionError 'System' $_.Exception.Message
 }
 
 # ---- Performance snapshot ----
@@ -1090,37 +1178,40 @@ try {
             $Data.Performance.CPU_LoadPct = [math]::Round(($loadValues | Measure-Object -Average).Average, 0)
         }
     }
+    if ($null -eq $Data.Performance.CPU_LoadPct) { throw 'The CPU provider returned no load measurement.' }
 }
-catch { Write-Warning "CPU load collection failed: $($_.Exception.Message)" }
+catch { Add-CollectionError 'CPU' $_.Exception.Message }
 
 try {
-    if ($null -ne $osInfo -and $osInfo.TotalVisibleMemorySize -gt 0) {
+    if ($null -ne $osInfo -and $osInfo.TotalVisibleMemorySize -gt 0 -and $null -ne $osInfo.FreePhysicalMemory) {
         $totalKB = $osInfo.TotalVisibleMemorySize
         $freeKB = $osInfo.FreePhysicalMemory
         $Data.Performance.Memory_TotalGB = [math]::Round($totalKB / 1MB, 1)
         $Data.Performance.Memory_FreeGB = [math]::Round($freeKB / 1MB, 1)
         $Data.Performance.Memory_UsedPct = [math]::Round((($totalKB - $freeKB) / $totalKB) * 100, 0)
     }
+    if ($null -eq $Data.Performance.Memory_UsedPct) { throw 'The memory provider returned no measurement.' }
 }
-catch { Write-Warning "Memory collection failed: $($_.Exception.Message)" }
+catch { Add-CollectionError 'Memory' $_.Exception.Message }
 
 try {
     $systemDrive = 'C:'
     if ($env:SystemDrive) { $systemDrive = $env:SystemDrive }
     $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $systemDrive) -ErrorAction Stop
-    if ($disk -and $disk.Size -gt 0) {
+    if ($disk -and $disk.Size -gt 0 -and $null -ne $disk.FreeSpace) {
         $Data.Performance.Disk = $systemDrive
         $Data.Performance.Disk_SizeGB = [math]::Round($disk.Size / 1GB, 1)
         $Data.Performance.Disk_FreeGB = [math]::Round($disk.FreeSpace / 1GB, 1)
         $Data.Performance.Disk_FreePct = [math]::Round(($disk.FreeSpace / $disk.Size) * 100, 0)
     }
+    if ($null -eq $Data.Performance.Disk_SizeGB) { throw 'The disk provider returned no measurement.' }
     $diskLatency = Get-DiskLatency
     if ($diskLatency) {
         $Data.Performance.Disk_LatencyMs = $diskLatency.AvgLatencyMs
         $Data.Performance.Disk_QueueLength = $diskLatency.QueueLength
     }
 }
-catch { Write-Warning "Disk collection failed: $($_.Exception.Message)" }
+catch { Add-CollectionError 'Disk' $_.Exception.Message }
 
 try {
     $logicalProcessors = [Environment]::ProcessorCount
@@ -1185,7 +1276,7 @@ catch {
         $Data.Network.AllDNS = @($dnsServers | Select-Object -Unique)
     }
     catch {
-        Write-Warning "Network config collection failed: $($_.Exception.Message)"
+        Add-CollectionError 'Network' $_.Exception.Message
     }
 }
 
@@ -1207,7 +1298,7 @@ if ($Data.VPN.Tunnels.Count -gt 0) {
     $Data.VPN_TunnelIP = $Data.VPN.Tunnels[0].Addresses[0]
     $Data.VPN_Detail = $Data.VPN.Tunnels[0].Description
 }
-foreach ($vpnError in $Data.VPN.Errors) { Add-Finding 'Warn' "VPN inspection incomplete - $vpnError" }
+foreach ($vpnError in $Data.VPN.Errors) { Add-CollectionError 'VPN' $vpnError }
 
 # ---- Proxy ----
 try {
@@ -1419,6 +1510,8 @@ if ($Data.Target -and $Data.Target.Ports) {
         Add-Finding 'Warn' ("Target {0} did not respond to ICMP ping (100% loss)" -f $Data.Target.Destination)
     }
 }
+$Data.CollectionErrors = $CollectionErrors.ToArray()
+if ($CollectionErrors.Count -gt 0) { $Data.CollectionStatus = 'Partial' }
 $Data.Findings = @($Findings.ToArray())
 
 # ---- Export (JSON + plain-text summary), then prune old exports ----
@@ -1436,8 +1529,7 @@ try {
         [System.IO.Directory]::CreateDirectory($exportDirectory) | Out-Null
     }
     $summaryText = Build-ServiceNowSummary -Data $Data -FindingsList $Findings -JsonPath $ExportPath
-    $Data | ConvertTo-Json -Depth 6 -ErrorAction Stop | Set-Content -LiteralPath $ExportPath -Encoding UTF8 -Force -ErrorAction Stop
-    $summaryText | Set-Content -LiteralPath $txtPath -Encoding UTF8 -Force -ErrorAction Stop
+    Write-TriageExportPair -JsonPath $ExportPath -TextPath $txtPath -Data $Data -Summary $summaryText
     $exportSucceeded = $true
 }
 catch {
@@ -1473,3 +1565,7 @@ else {
         }
     }
 }
+
+if (-not $exportSucceeded) { exit 1 }
+if ($Data.CollectionStatus -eq 'Partial') { exit 2 }
+exit 0

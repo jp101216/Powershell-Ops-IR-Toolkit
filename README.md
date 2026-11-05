@@ -1,4 +1,9 @@
 # Powershell-Ops-IR-Toolkit
+
+Current release version 3.0.0.
+
+The release ZIP provides NetTriage, Compare-NetTriage, Endpoint Tune-Up, and System Update, with documentation, an example infrastructure configuration, and SHA256 manifests. The repository also contains the legacy live-response collector documented below.
+
 A small suite of powershell tools. Endpoint triage, incident response, and day-to-day system maintenance.  Built with a consistent house style, structured param blocks, color coded console output, a quiet mode that emits a ServiceNow pasteable output and Json support for every run.
 
 Built while supporting enterprise Tier 2 technical operations in a healthcare IT environment, and extended through home-lab detection engineering work.
@@ -9,7 +14,7 @@ All scripts are PowerShell 5.1+ compatible and ship with full comment-based help
 
 ---
 
-## Invoke-LiveResponse.ps1
+## Invoke-LiveResponse.ps1 (repository legacy collector)
 
 For ongoing live-response development, see [LiveResponse NG](https://github.com/jp101216/LiveResponse-NG).
 
@@ -181,6 +186,7 @@ powershell.exe -File .\Invoke-EndpointTuneUp.ps1 -Phase Cleanup -DeepClean -Skip
 | `-Phase` | Network, Cleanup, Optimize | Select one or more maintenance phases |
 | `-RemoteSafe` | off | Keep DNS flush, registration, and snapshots available while protecting disruptive network changes, policy triggers, and automatic reboot |
 | `-SkipTempCleanup` | off | Skip deletion of temporary files |
+| `-MinTempAgeHours` | 24 | Preserve files and directories with recent creation or modification timestamps |
 | `-WhatIf` | off | Preview maintenance steps without writing logs or changing the clipboard |
 | `-SkipStackReset` | off | Skip Winsock/TCP-IP reset — use on static-IP machines |
 | `-SkipAdapterRestart` | off | Skip the two steps that briefly drop the remote session |
@@ -190,6 +196,10 @@ powershell.exe -File .\Invoke-EndpointTuneUp.ps1 -Phase Cleanup -DeepClean -Skip
 | `-RebootDelaySeconds` | 60 | Countdown before auto-reboot |
 
 The transcript and JSON step report default to `C:\ProgramData\EndpointTuneUp\Logs`.
+
+Cleanup skips reparse-point paths and uses individual file deletion and empty-directory removal. Its JSON counts include deleted files and bytes, recent items, links, locked files, and errors.
+
+NIC sleep changes use supported selective-suspend and media-disconnect settings with adapter restart deferred. The report records per-adapter verification and unsupported settings. Batch repair steps report Success, Partial, Failed, or Skipped, with per-target details.
 
 The IP preflight detects manually configured IPv4 and IPv6 addresses. Manual addresses or an unavailable IP inspection cause stack-reset steps to be skipped. The JSON report records the preflight result and the detected static addresses.
 
@@ -225,6 +235,25 @@ powershell -File .\Invoke-UpdateSystem.ps1 -AutoInstall -NonInteractive
 Requires an elevated session (`#Requires -RunAsAdministrator`). The transcript and JSON report default to `%ProgramData%\SystemUpdateToolkit\`. The report records scan status, each update’s download and installation results, and whether a reboot is required.
 
 ---
+
+## Automation and reports
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Command completed successfully, including a diagnostic run that found a connectivity problem |
+| 1 | Execution or report publication failed |
+| 2 | Collection was incomplete or maintenance completed with partial failures |
+| 3010 | Maintenance or updates completed and Windows reported a reboot requirement |
+
+NetTriage stores unavailable measurements as null and lists CollectionErrors. JSON and text reports identify the same completed collection. A failed replacement restores the previous report pair. System Update and Endpoint Tune-Up publish JSON through atomic file replacement.
+
+The maintained scripts include ToolVersion in their JSON reports. Automation can inspect RunStatus and ExitCode in maintenance reports and CollectionStatus in NetTriage exports.
+
+## Release files
+
+Copy CoreInfrastructure.example.json to CoreInfrastructure.json and supply the organization's own hosts. Example hostnames are placeholders.
+
+SHA256SUMS.txt beside the ZIP verifies the archive. The manifest inside the ZIP verifies its payload files. Build a package locally with `./build/Build-Release.ps1`.
 
 ## License
 

@@ -6,7 +6,7 @@
     adapters, then cleans and optimizes the PC.
 
 .DESCRIPTION
-    Version 2.0.0 - modernized from Invoke-EndpointTuneUp.ps1.
+    Version 3.0.0 - updated from Invoke-EndpointTuneUp.ps1.
 
     Designed to be run in an ELEVATED PowerShell session on the user's machine
     (e.g., a remote support session using admin credentials from a PAM/privileged-access vault).
@@ -107,6 +107,10 @@
     Skip temp folder cleanup. Combine with -Phase Cleanup -DeepClean to run
     DISM and SFC without clearing temp folders.
 
+.PARAMETER MinTempAgeHours
+    Minimum age of both creation and last-write timestamps for temp cleanup.
+    Defaults to 24 hours. Reparse-point paths are skipped.
+
 .PARAMETER SkipStackReset
     Skip 'netsh winsock reset' and 'netsh int ip/ipv6 reset'. Use this on
     machines with STATIC IP configs (the stack reset wipes them) or when a
@@ -199,6 +203,8 @@ param(
     [string[]]$Phase = @('Network', 'Cleanup', 'Optimize'),
     [switch]$RemoteSafe,
     [switch]$SkipTempCleanup,
+    [ValidateRange(0, 87600)]
+    [int]$MinTempAgeHours = 24,
     [switch]$SkipStackReset,
     [switch]$SkipAdapterRestart,
     [switch]$ClearRecycleBin,
@@ -226,6 +232,9 @@ $script:IpconfigBeforeFile = $null
 $script:IpconfigAfterFile = $null
 $script:RebootNeeded = $false
 $script:FatalError = $null
+$script:ReportWriteFailed = $false
+$script:StepDetails = New-Object System.Collections.Generic.List[object]
+$script:CleanupResults = @()
 $script:CurrentPhase = 'Setup'
 $script:QuietMode = [bool]$Quiet
 $script:NonInteractiveMode = [bool]$NonInteractive
@@ -293,7 +302,89 @@ function Add-SkippedStep {
         Status          = 'Skipped'
         DurationSeconds = 0
         Error           = $Reason
+        Details         = @()
     }) | Out-Null
+}
+
+function Add-StepDetail {
+    param(
+        [string]$Target,
+        [ValidateSet('Success', 'Failed', 'Skipped')][string]$Status,
+        [string]$Message
+    )
+    $script:StepDetails.Add([pscustomobject]@{ Target = $Target; Status = $Status; Message = $Message }) | Out-Null
+    Write-Log "$Target - $Message"
+}
+
+function Test-ReparsePath {
+    param([string]$Path)
+    $current = [System.IO.Path]::GetFullPath($Path)
+    while ($current) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+        $parent = [System.IO.Directory]::GetParent($current)
+        if ($null -eq $parent) { break }
+        $current = $parent.FullName
+    }
+    return $false
+}
+
+function Clear-OldTemporaryFiles {
+    param([string]$Path, [datetime]$CutoffUtc)
+    $counts = [pscustomobject]@{
+        Path = $Path; FilesDeleted = 0; DirectoriesDeleted = 0; BytesDeleted = [long]0
+        RecentSkipped = 0; LinksSkipped = 0; LockedSkipped = 0; MissingSkipped = 0; Failed = 0; Errors = @()
+    }
+    $pending = New-Object System.Collections.Generic.Stack[object]
+    $pending.Push([pscustomobject]@{ Path = $Path; Visited = $false; Root = $true })
+    while ($pending.Count -gt 0) {
+        $entry = $pending.Pop()
+        try {
+            if (Test-ReparsePath $entry.Path) { $counts.LinksSkipped++; continue }
+            $item = Get-Item -LiteralPath $entry.Path -Force -ErrorAction Stop
+            if ($item.PSIsContainer -and -not $entry.Visited) {
+                $pending.Push([pscustomobject]@{ Path = $entry.Path; Visited = $true; Root = $entry.Root })
+                foreach ($child in (Get-ChildItem -LiteralPath $entry.Path -Force -ErrorAction Stop)) {
+                    if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                        $counts.LinksSkipped++
+                    }
+                    else {
+                        $pending.Push([pscustomobject]@{ Path = $child.FullName; Visited = $false; Root = $false })
+                    }
+                }
+                continue
+            }
+            if ($entry.Root) { continue }
+            if ($item.CreationTimeUtc -gt $CutoffUtc -or $item.LastWriteTimeUtc -gt $CutoffUtc) {
+                $counts.RecentSkipped++
+                continue
+            }
+            if ($item.PSIsContainer) {
+                # Delete only an empty directory, preserving newly created content.
+                if (@(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop).Count -gt 0) { continue }
+                [System.IO.Directory]::Delete($item.FullName, $false)
+                $counts.DirectoriesDeleted++
+            }
+            else {
+                $length = $item.Length
+                [System.IO.File]::Delete($item.FullName)
+                $counts.FilesDeleted++
+                $counts.BytesDeleted += $length
+            }
+        }
+        catch {
+            if (-not (Test-Path -LiteralPath $entry.Path)) { $counts.MissingSkipped++; continue }
+            $exception = $_.Exception
+            while ($exception.InnerException) { $exception = $exception.InnerException }
+            $code = $exception.HResult -band 65535
+            if ($code -in @(32, 33)) { $counts.LockedSkipped++ }
+            else {
+                $counts.Failed++
+                if ($counts.Errors.Count -lt 20) { $counts.Errors += "$($entry.Path) - $($_.Exception.Message)" }
+            }
+        }
+    }
+    return $counts
 }
 
 function Get-NetworkResetSafety {
@@ -332,6 +423,7 @@ function Invoke-NativeCommand {
         & $Command @Arguments
     }
     $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 3010 -and $AllowedExitCodes -contains 3010) { $script:RebootNeeded = $true }
     if ($null -eq $exitCode) { $exitCode = 0 }
     if ($AllowedExitCodes -notcontains $exitCode) {
         if ($WarnOnNonZero) {
@@ -386,30 +478,64 @@ function Invoke-Step {
         }
     }
     Write-Log "==> $Name"
+    $script:StepDetails = New-Object System.Collections.Generic.List[object]
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         & $Action
         $sw.Stop()
-        Write-Log ("    done: {0} ({1:n1}s)" -f $Name, $sw.Elapsed.TotalSeconds)
+        $failures = @($script:StepDetails | Where-Object { $_.Status -eq 'Failed' })
+        $successes = @($script:StepDetails | Where-Object { $_.Status -eq 'Success' })
+        $status = 'Success'
+        if ($failures.Count -gt 0) {
+            $status = 'Failed'
+            if ($successes.Count -gt 0) { $status = 'Partial' }
+            $script:StepFailures.Add($Name) | Out-Null
+        }
+        elseif ($script:StepDetails.Count -gt 0 -and $successes.Count -eq 0) {
+            $status = 'Skipped'
+            $script:SkippedSteps.Add($Name) | Out-Null
+        }
+        Write-Log ("    {0}: {1} ({2:n1}s)" -f $status, $Name, $sw.Elapsed.TotalSeconds)
         $script:StepResults.Add([pscustomobject]@{
             Phase           = $script:CurrentPhase
             Name            = $Name
-            Status          = 'Success'
+            Status          = $status
             DurationSeconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-            Error           = $null
+            Error           = (@($failures | ForEach-Object { $_.Message }) -join ' | ')
+            Details         = $script:StepDetails.ToArray()
         }) | Out-Null
     }
     catch {
         $sw.Stop()
         $script:StepFailures.Add($Name) | Out-Null
+        $status = 'Failed'
+        if (@($script:StepDetails | Where-Object { $_.Status -eq 'Success' }).Count -gt 0) { $status = 'Partial' }
         Write-Log ("    FAILED: {0} ({1:n1}s) -- {2}" -f $Name, $sw.Elapsed.TotalSeconds, $_.Exception.Message) -Level Warn
         $script:StepResults.Add([pscustomobject]@{
             Phase           = $script:CurrentPhase
             Name            = $Name
-            Status          = 'Failed'
+            Status          = $status
             DurationSeconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
             Error           = $_.Exception.Message
+            Details         = $script:StepDetails.ToArray()
         }) | Out-Null
+    }
+}
+
+function Write-AtomicJsonReport {
+    param([string]$Path, $Report)
+    $destination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $directory = Split-Path -Parent $destination
+    [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    $temporary = Join-Path $directory ([guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $Report | ConvertTo-Json -Depth 8 -ErrorAction Stop |
+            Set-Content -LiteralPath $temporary -Encoding UTF8 -Confirm:$false -ErrorAction Stop
+        if ([System.IO.File]::Exists($destination)) { [System.IO.File]::Replace($temporary, $destination, [NullString]::Value) }
+        else { [System.IO.File]::Move($temporary, $destination) }
+    }
+    finally {
+        if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) }
     }
 }
 
@@ -558,8 +684,8 @@ try {
             try {
                 $cutoff = (Get-Date).AddDays(-$LogRetentionDays)
                 foreach ($file in (Get-ChildItem -LiteralPath $logDir -File -ErrorAction Stop)) {
-                    $isAuditFile = $file.Name -match '^TuneUp_.+_\d{8}-\d{6}(?:-\d{3})?\.(?:log|json)$' -or
-                        $file.Name -match '^Ipconfig(?:Before|After)_.+_\d{8}-\d{6}(?:-\d{3})?\.txt$'
+                    $isAuditFile = $file.Name -match '^TuneUp_.+_\d{8}-\d{6}(?:-\d{3}(?:-[0-9a-f]{8})?)?\.(?:log|json)$' -or
+                        $file.Name -match '^Ipconfig(?:Before|After)_.+_\d{8}-\d{6}(?:-\d{3}(?:-[0-9a-f]{8})?)?\.txt$'
                     if ($isAuditFile -and $file.LastWriteTime -lt $cutoff) {
                         Remove-Item -LiteralPath $file.FullName -Force -Confirm:$false -ErrorAction Stop
                     }
@@ -570,7 +696,7 @@ try {
             }
         }
 
-        $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+        $timestamp = (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
         $script:LogFile = Join-Path $logDir ("TuneUp_{0}_{1}.log" -f $env:COMPUTERNAME, $timestamp)
         $script:ReportFile = $ReportPath
         if ([string]::IsNullOrWhiteSpace($script:ReportFile)) {
@@ -656,23 +782,37 @@ try {
         Invoke-NativeCommand -Command 'netsh.exe' -Arguments @('int', 'tcp', 'set', 'global', 'autotuninglevel=normal') -SuppressOutput | Out-Null
     }
 
-    Invoke-Step 'Disable power-saving on physical network adapters' -DisruptsNetwork -Target 'NIC power-saving' -Operation 'Disable NIC power-saving' {
-        Get-NetAdapter -Physical -ErrorAction Stop | ForEach-Object {
-            $adapterName = $_.Name
-            # SilentlyContinue is deliberate here: adapters without power
-            # management support return no object, and that is not a failure.
-            $pm = Get-NetAdapterPowerManagement -Name $adapterName -ErrorAction SilentlyContinue
-            if ($null -eq $pm) { return }
-            if ($pm.AllowComputerToTurnOffDevice -notin @('Unsupported', 'Inactive')) {
-                try {
-                    $pm.AllowComputerToTurnOffDevice = 'Disabled'
-                    $pm | Set-NetAdapterPowerManagement -ErrorAction Stop
-                    Write-Log "    power saving disabled on: $adapterName"
+    Invoke-Step 'Disable supported NIC sleep settings' -DisruptsNetwork -Target 'NIC sleep settings' -Operation 'Disable supported NIC sleep settings' {
+        $adapters = @(Get-NetAdapter -Physical -ErrorAction Stop)
+        if ($adapters.Count -eq 0) { Add-StepDetail 'Physical adapters' 'Skipped' 'No physical adapters found.' }
+        foreach ($adapter in $adapters) {
+            try {
+                $pm = Get-NetAdapterPowerManagement -Name $adapter.Name -ErrorAction Stop
+                $changes = @{}
+                $supported = 0
+                foreach ($property in @('DeviceSleepOnDisconnect', 'SelectiveSuspend')) {
+                    if ($null -eq $pm) { continue }
+                    $value = [string]$pm.$property
+                    if ($value -in @('Enabled', '2')) { $changes[$property] = $true; $supported++ }
+                    elseif ($value -in @('Disabled', '1')) { $supported++ }
                 }
-                catch {
-                    Write-Log "    could not change power management on ${adapterName}: $($_.Exception.Message)" -Level Warn
+                if ($supported -eq 0) {
+                    Add-StepDetail $adapter.Name 'Skipped' 'The adapter exposes no supported sleep setting.'
+                    continue
                 }
+                if ($changes.Count -gt 0) {
+                    Disable-NetAdapterPowerManagement -InputObject $pm @changes -NoRestart -Confirm:$false -ErrorAction Stop | Out-Null
+                    $verified = Get-NetAdapterPowerManagement -Name $adapter.Name -ErrorAction Stop
+                    foreach ($property in $changes.Keys) {
+                        if ([string]$verified.$property -notin @('Disabled', '1')) {
+                            throw "The requested $property setting could not be verified."
+                        }
+                    }
+                    Add-StepDetail $adapter.Name 'Success' 'Supported sleep settings disabled with adapter restart deferred.'
+                }
+                else { Add-StepDetail $adapter.Name 'Success' 'Supported sleep settings are already disabled.' }
             }
+            catch { Add-StepDetail $adapter.Name 'Failed' $_.Exception.Message }
         }
     }
 
@@ -703,26 +843,19 @@ try {
             $upAdapters = @(Get-NetAdapter -Physical -ErrorAction Stop |
                 Where-Object { $_.Status -eq 'Up' })
             if ($upAdapters.Count -eq 0) {
-                Write-Log '    no physical adapters in Up state - nothing to restart.'
+                Add-StepDetail 'Physical adapters' 'Skipped' 'No physical adapters are up.'
                 return
             }
             $expectedNames = @($upAdapters.Name)
             $restartFailures = New-Object System.Collections.Generic.List[string]
             foreach ($adapter in $upAdapters) {
-                try {
-                    Restart-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction Stop
-                }
+                try { Restart-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction Stop }
                 catch {
                     $restartFailures.Add($adapter.Name) | Out-Null
-                    Write-Log "    FAILED to restart $($adapter.Name): $($_.Exception.Message)" -Level Warn
+                    Add-StepDetail $adapter.Name 'Failed' $_.Exception.Message
                 }
             }
-            if ($restartFailures.Count -eq $upAdapters.Count) {
-                throw 'All physical adapters failed to restart.'
-            }
-            if ($restartFailures.Count -gt 0) {
-                Write-Log "    some adapters failed to restart: $($restartFailures -join ', ')" -Level Warn
-            }
+            if ($restartFailures.Count -eq $upAdapters.Count) { return }
             $adapterWaitSeconds = 60
             $deadline = (Get-Date).AddSeconds($adapterWaitSeconds)
             $down = @()
@@ -734,8 +867,9 @@ try {
                 # An adapter that no longer appears is still down, not up.
                 $down = @($expectedNames | Where-Object { $currentUpNames -notcontains $_ })
             } until ($down.Count -eq 0 -or (Get-Date) -ge $deadline)
-            if ($down.Count -gt 0) {
-                Write-Log "    not back Up after ${adapterWaitSeconds}s: $($down -join ', ')" -Level Warn
+            foreach ($adapterName in $expectedNames | Where-Object { $_ -notin $restartFailures }) {
+                if ($adapterName -in $down) { Add-StepDetail $adapterName 'Failed' "Adapter did not return up within $adapterWaitSeconds seconds." }
+                else { Add-StepDetail $adapterName 'Success' 'Adapter restarted and returned up.' }
             }
         }
 
@@ -775,12 +909,18 @@ try {
             $tempTargets += Get-ChildItem -LiteralPath "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue |
                 ForEach-Object { Join-Path $_.FullName 'AppData\Local\Temp' } |
                 Where-Object { Test-Path -LiteralPath $_ -PathType Container }
+            $cutoff = (Get-Date).ToUniversalTime().AddHours(-$MinTempAgeHours)
             foreach ($target in $tempTargets) {
-                $items = @(Get-ChildItem -LiteralPath $target -Force -ErrorAction SilentlyContinue)
-                foreach ($item in $items) {
-                    Remove-Item -LiteralPath $item.FullName -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
+                $counts = Clear-OldTemporaryFiles -Path $target -CutoffUtc $cutoff
+                $script:CleanupResults += $counts
+                if ($counts.FilesDeleted -gt 0 -or $counts.DirectoriesDeleted -gt 0) {
+                    Add-StepDetail $target 'Success' "$($counts.FilesDeleted) file(s) and $($counts.DirectoriesDeleted) empty directory(s) deleted."
                 }
-                Write-Log "    processed: $target ($($items.Count) item(s) found; in-use files skipped)"
+                if ($counts.Failed -gt 0) { Add-StepDetail $target 'Failed' ($counts.Errors -join ' | ') }
+                elseif ($counts.FilesDeleted -eq 0 -and $counts.DirectoriesDeleted -eq 0) {
+                    Add-StepDetail $target 'Skipped' 'No eligible temporary files were removed.'
+                }
+                Write-Log "    $target - recent $($counts.RecentSkipped), links $($counts.LinksSkipped), locked $($counts.LockedSkipped), failed $($counts.Failed)"
             }
         }
     }
@@ -794,7 +934,7 @@ try {
 
     if ($DeepClean) {
         Invoke-Step 'DISM component-store cleanup (10-30 min)' -Target 'Component store' -Operation 'DISM component-store cleanup' {
-            Invoke-NativeCommand -Command 'dism.exe' -Arguments @('/Online', '/Cleanup-Image', '/StartComponentCleanup', '/NoRestart') -SuppressOutput:$script:QuietMode | Out-Null
+            Invoke-NativeCommand -Command 'dism.exe' -Arguments @('/Online', '/Cleanup-Image', '/StartComponentCleanup', '/NoRestart') -AllowedExitCodes @(0, 3010) -SuppressOutput:$script:QuietMode | Out-Null
         }
         Invoke-Step 'System file check - sfc /scannow (10-20 min)' -Target 'System files' -Operation 'Run sfc /scannow' {
             Invoke-NativeCommand -Command 'sfc.exe' -Arguments @('/scannow') -SuppressOutput:$script:QuietMode | Out-Null
@@ -822,10 +962,10 @@ try {
     Invoke-Step 'Trigger SCCM/MECM client actions (if client present)' -DisruptsNetwork -Target 'SCCM client' -Operation 'Trigger SCCM client schedules' {
         $ccmService = Get-Service -Name CcmExec -ErrorAction SilentlyContinue
         if ($null -eq $ccmService) {
-            Write-Log '    SCCM client not found - skipped.'
+            Add-StepDetail 'SCCM client' 'Skipped' 'Client not found.'
         }
         elseif ($ccmService.Status -ne 'Running') {
-            Write-Log "    SCCM client found but not running ($($ccmService.Status)) - skipped." -Level Warn
+            Add-StepDetail 'SCCM client' 'Skipped' "Client is not running ($($ccmService.Status))."
         }
         else {
             $schedules = [ordered]@{
@@ -842,16 +982,16 @@ try {
                         -ErrorAction Stop
                 }
                 catch {
-                    Write-Log "    FAILED to trigger ${name}: $($_.Exception.Message)" -Level Warn
+                    Add-StepDetail $name 'Failed' $_.Exception.Message
                     continue
                 }
                 if ($null -ne $cimResult -and $cimResult.ReturnValue -eq 0) {
-                    Write-Log "    triggered: $name"
+                    Add-StepDetail $name 'Success' 'Schedule triggered.'
                 }
                 else {
                     $returnValue = $null
                     if ($null -ne $cimResult) { $returnValue = $cimResult.ReturnValue }
-                    Write-Log "    FAILED to trigger ${name} (ReturnValue $returnValue)" -Level Warn
+                    Add-StepDetail $name 'Failed' "Trigger returned $returnValue."
                 }
             }
         }
@@ -888,7 +1028,22 @@ finally {
     if ($null -ne $freeBefore -and $null -ne $freeAfter) {
         $spaceFreed = [math]::Round($freeAfter - $freeBefore, 2)
     }
+    $exitCode = 0
+    $runStatus = 'Success'
+    if ($script:FatalError) { $exitCode = 1; $runStatus = 'Failed' }
+    elseif ($script:StepFailures.Count -gt 0) {
+        $exitCode = 1
+        $runStatus = 'Failed'
+        if (@($script:StepResults | Where-Object { $_.Status -in @('Success', 'Partial') }).Count -gt 0) {
+            $exitCode = 2
+            $runStatus = 'Partial'
+        }
+    }
+    elseif ($script:RebootNeeded -and -not $WhatIfPreference) { $exitCode = 3010; $runStatus = 'RebootRequired' }
     $report = [ordered]@{
+        ToolVersion     = '3.0.0'
+        RunStatus       = $runStatus
+        ExitCode        = $exitCode
         Timestamp       = (Get-Date).ToString('o')
         Computer        = $env:COMPUTERNAME
         User            = "$env:USERDOMAIN\$env:USERNAME"
@@ -899,6 +1054,7 @@ finally {
             Phase              = $Phase
             RemoteSafe         = [bool]$RemoteSafe
             SkipTempCleanup    = [bool]$SkipTempCleanup
+            MinTempAgeHours    = $MinTempAgeHours
             SkipStackReset     = [bool]$SkipStackReset
             SkipAdapterRestart = [bool]$SkipAdapterRestart
             ClearRecycleBin    = [bool]$ClearRecycleBin
@@ -913,6 +1069,7 @@ finally {
         ElapsedSeconds  = [math]::Round($stopwatch.Elapsed.TotalSeconds, 1)
         Steps           = $script:StepResults
         NetworkSafety   = $script:NetworkSafety
+        Cleanup         = $script:CleanupResults
         FreeBeforeGB    = $freeBefore
         FreeAfterGB     = $freeAfter
         SpaceFreedGB    = $spaceFreed
@@ -930,11 +1087,11 @@ finally {
     }
     if ($null -ne $script:ReportFile) {
         try {
-            $report | ConvertTo-Json -Depth 4 -ErrorAction Stop |
-                Set-Content -LiteralPath $script:ReportFile -Encoding utf8 -Confirm:$false -ErrorAction Stop
+            Write-AtomicJsonReport -Path $script:ReportFile -Report $report
             Write-Log "Report saved to: $($script:ReportFile)"
         }
         catch {
+            $script:ReportWriteFailed = $true
             Write-Log "Could not write JSON report: $($_.Exception.Message)" -Level Warn
         }
     }
@@ -945,3 +1102,6 @@ finally {
         try { Stop-Transcript -ErrorAction Stop | Out-Null } catch { }
     }
 }
+
+if ($script:ReportWriteFailed) { exit 1 }
+exit $exitCode

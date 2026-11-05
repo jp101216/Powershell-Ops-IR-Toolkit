@@ -13,6 +13,9 @@
     must be new paths. The default is a unique Comparison_* pair in the user's
     local NetTriage folder. The command works offline with PowerShell 5.1 or 7.
 
+.NOTES
+    Version 3.0.0
+
 .PARAMETER BeforePath
     JSON export collected before the troubleshooting change.
 
@@ -269,6 +272,7 @@ foreach ($path in @($ExportPath, $textPath)) {
 $beforeTime = Get-Field $before 'Collected'
 $afterTime = Get-Field $after 'Collected'
 $report = [ordered]@{
+    ToolVersion = '3.0.0'
     SchemaVersion = 1
     Computer = $before.Computer
     BeforePath = $before.Path
@@ -349,3 +353,5 @@ if ($CopyToClipboard) {
 }
 if ($Quiet) { Write-Output $summary }
 else { Write-Host $summary -ForegroundColor Cyan }
+
+exit 0

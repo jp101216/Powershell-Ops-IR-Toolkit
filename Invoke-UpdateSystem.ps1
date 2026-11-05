@@ -5,7 +5,7 @@
     Scans for and applies driver, firmware, and BIOS updates on Windows 10/11 and Windows Server.
 
 .DESCRIPTION
-    Version 2.0.0 - modernized from Invoke-UpdateSystem.ps1.
+    Version 3.0.0 - updated from Invoke-UpdateSystem.ps1.
 
     A layered, OPSEC-friendly update assistant:
       1. Reports system identity and the current BIOS / firmware version.
@@ -138,10 +138,29 @@ $script:TranscriptStarted = $false
 $script:LogFile = $null
 $script:ReportFile = $null
 $script:Report = $null
+$script:FatalError = $null
+$script:ReportWriteFailed = $false
 
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
+function Write-AtomicJsonReport {
+    param([string]$Path, $Report)
+    $destination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $directory = Split-Path -Parent $destination
+    [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    $temporary = Join-Path $directory ([guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $Report | ConvertTo-Json -Depth 8 -ErrorAction Stop |
+            Set-Content -LiteralPath $temporary -Encoding UTF8 -Confirm:$false -ErrorAction Stop
+        if ([System.IO.File]::Exists($destination)) { [System.IO.File]::Replace($temporary, $destination, [NullString]::Value) }
+        else { [System.IO.File]::Move($temporary, $destination) }
+    }
+    finally {
+        if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) }
+    }
+}
+
 function Write-Section {
     param([Parameter(Mandatory = $true)][string]$Text)
     Write-Host ''
@@ -563,11 +582,13 @@ function Invoke-BiosRouting {
                     Write-Good "$($tool.Name) installed. Open it to review and apply BIOS/firmware updates."
                 }
                 else {
+                    $script:Report.Errors += "OEM tool installation failed (exit code $LASTEXITCODE)."
                     Write-Bad "winget install failed (exit code $LASTEXITCODE)."
                     Write-Info "Try: winget search '$($tool.SearchName)' to confirm the package id."
                 }
             }
             catch {
+                $script:Report.Errors += "OEM tool installation failed. $($_.Exception.Message)"
                 Write-Bad "winget install failed: $($_.Exception.Message)"
                 Write-Info "Try: winget search '$($tool.SearchName)' to confirm the package id."
             }
@@ -601,6 +622,7 @@ function Invoke-WingetUpgrade {
     param()
 
     Write-Section 'Application & Utility Upgrades (winget)'
+    $script:Report.WingetStatus = 'Skipped'
     if ($WhatIfPreference) {
         $null = $PSCmdlet.ShouldProcess('all installed apps', 'winget upgrade --all')
         return $false
@@ -608,6 +630,8 @@ function Invoke-WingetUpgrade {
 
     $winget = Test-Winget
     if ($null -eq $winget) {
+        $script:Report.WingetStatus = 'Failed'
+        $script:Report.Errors += 'winget is unavailable.'
         Write-Bad 'winget not found. Install "App Installer" from the Microsoft Store.'
         return $false
     }
@@ -642,10 +666,13 @@ function Invoke-WingetUpgrade {
     if (-not (Test-IsInteractive)) { $upgradeArgs += '--disable-interactivity' }
     & winget @upgradeArgs | Out-Host
     if ($LASTEXITCODE -eq 0) {
+        $script:Report.WingetStatus = 'Succeeded'
         Write-Good 'winget upgrade complete.'
         return $true
     }
     else {
+        $script:Report.WingetStatus = 'Failed'
+        $script:Report.Errors += "winget upgrade failed (exit code $LASTEXITCODE)."
         Write-Bad "winget upgrade failed (exit code $LASTEXITCODE)."
         return $false
     }
@@ -737,7 +764,7 @@ try {
             New-Item -ItemType Directory -Path $logDir -Force -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
         }
 
-        $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+        $timestamp = (Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
         $script:LogFile = Join-Path $logDir ("update_{0}.log" -f $timestamp)
         $script:ReportFile = $ReportPath
         if ([string]::IsNullOrWhiteSpace($script:ReportFile)) {
@@ -754,6 +781,9 @@ try {
     }
 
     $script:Report = [ordered]@{
+        ToolVersion     = '3.0.0'
+        RunStatus       = 'Success'
+        ExitCode        = 0
         Timestamp       = (Get-Date).ToString('o')
         PowerShell      = $PSVersionTable.PSVersion.ToString()
         PSEdition       = $PSVersionTable.PSEdition
@@ -763,6 +793,7 @@ try {
         WindowsUpdateRuns = @()
         BiosTool        = $null
         WingetUpgraded  = $false
+        WingetStatus    = 'NotRequested'
         RebootRequired  = $false
         Errors          = @()
     }
@@ -790,19 +821,36 @@ try {
     }
 }
 catch {
+    $script:FatalError = $_.Exception.Message
     Write-Bad "Fatal error: $($_.Exception.Message)"
     if ($null -ne $script:Report) {
         $script:Report.Errors += $_.Exception.Message
     }
 }
 finally {
+    $exitCode = 0
+    if ($script:FatalError) { $exitCode = 1 }
+    elseif ($null -ne $script:Report) {
+        $runs = @($script:Report.WindowsUpdateRuns)
+        if (@($runs | Where-Object { $_.ScanStatus -eq 'Failed' -or $_.InstallStatus -eq 'Failed' }).Count -gt 0) { $exitCode = 1 }
+        elseif ($script:Report.Errors.Count -gt 0) { $exitCode = 2 }
+        elseif ($script:Report.RebootRequired -and -not $WhatIfPreference) { $exitCode = 3010 }
+    }
+    if ($null -ne $script:Report) {
+        $script:Report.ExitCode = $exitCode
+        switch ($exitCode) {
+            1 { $script:Report.RunStatus = 'Failed' }
+            2 { $script:Report.RunStatus = 'Partial' }
+            3010 { $script:Report.RunStatus = 'RebootRequired' }
+        }
+    }
     if ($null -ne $script:Report -and $null -ne $script:ReportFile) {
         try {
-            $script:Report | ConvertTo-Json -Depth 6 -ErrorAction Stop |
-                Set-Content -LiteralPath $script:ReportFile -Encoding utf8 -Confirm:$false -ErrorAction Stop
+            Write-AtomicJsonReport -Path $script:ReportFile -Report $script:Report
             Write-Info "Report saved to: $($script:ReportFile)"
         }
         catch {
+            $script:ReportWriteFailed = $true
             Write-Warn "Could not write JSON report: $($_.Exception.Message)"
         }
     }
@@ -821,3 +869,6 @@ if ($AllowReboot -and $null -ne $script:Report -and $script:Report.RebootRequire
         }
     }
 }
+
+if ($script:ReportWriteFailed) { exit 1 }
+exit $exitCode

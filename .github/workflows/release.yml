@@ -1,0 +1,58 @@
+name: Publish release
+
+on:
+  workflow_run:
+    workflows: [Windows smoke tests]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-toolkit-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Build and publish version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath VERSION)) { exit 0 }
+          $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid release version.' }
+          $tag = "v$version"
+          $existing = gh release list --limit 100 --json tagName | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect existing releases.' }
+          if ($tag -in @($existing | ForEach-Object { $_.tagName })) {
+            $release = gh release view $tag --json isDraft,targetCommitish | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the existing release.' }
+            if (-not $release.isDraft) { exit 0 }
+            if ($release.targetCommitish -ne $env:RELEASE_SHA) { throw 'The existing draft targets a different commit.' }
+          }
+          else {
+            gh release create $tag --draft --target $env:RELEASE_SHA --title "PowerShell Ops IR Toolkit $tag" --notes-file CHANGELOG.md
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create the release draft.' }
+          }
+          ./build/Build-Release.ps1 | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
+          gh release upload $tag "./dist/Powershell-Ops-IR-Toolkit-$tag.zip" ./dist/SHA256SUMS.txt --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed.' }
+          gh release edit $tag --draft=false
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }
