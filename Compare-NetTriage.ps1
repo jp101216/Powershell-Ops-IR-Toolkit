@@ -92,6 +92,9 @@ function Read-Snapshot {
     $collected = $null
     $timestamp = Get-Field $data 'CollectedUtc'
     if ($timestamp -is [datetime]) {
+        if ($timestamp.Kind -eq [DateTimeKind]::Unspecified) {
+            $timestamp = [datetime]::SpecifyKind($timestamp, [DateTimeKind]::Utc)
+        }
         $collected = ([datetimeoffset]$timestamp).ToUniversalTime()
     }
     elseif ($timestamp) {

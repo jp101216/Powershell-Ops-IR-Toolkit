@@ -89,6 +89,10 @@ try {
     $rtt = @($result.Quality | Where-Object { $_.Unit -eq 'ms' })
     Assert-Result ($rtt.Count -eq 1 -and $rtt[0].Delta -eq -20) 'Gateway RTT delta is incorrect.'
     Assert-Result (([datetimeoffset]$result.BeforeCollectedUtc).Millisecond -eq 123 -and ([datetimeoffset]$result.AfterCollectedUtc).Millisecond -eq 456) 'Collection timestamp precision was lost.'
+    $before.CollectedUtc = '2026-11-05T10:00:00.123'
+    $result = Invoke-Comparison $before $after
+    Assert-Result (([datetimeoffset]$result.BeforeCollectedUtc).UtcDateTime.Hour -eq 10) 'A CollectedUtc value without an offset must be interpreted as UTC.'
+    $before = New-Snapshot $false
 
     $after.Target.Destination = 'different.example.com'
     $result = Invoke-Comparison $before $after
