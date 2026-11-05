@@ -49,8 +49,23 @@ try {
         $triage = Get-Content -LiteralPath $exportPath -Raw | ConvertFrom-Json
         Assert-Result ($triage.CoreInfrastructure.Count -eq 1 -and $triage.CoreInfrastructure[0].Success) 'Configured TCP probe failed.'
         Assert-Result ($triage.Target.Ports.Count -eq 1 -and $triage.Target.Ports[0].Success) 'Single-target TCP probe failed.'
+        Assert-Result ($triage.Target.Route.InterfaceIndex -gt 0 -and $triage.Target.Route.RemoteAddress -eq '127.0.0.1' -and -not $triage.Target.Route.Error) 'The native route lookup did not identify the loopback destination.'
+        Assert-Result ($triage.CoreInfrastructure[0].ResolvedAddress -eq '127.0.0.1' -and $triage.CoreInfrastructure[0].Route.InterfaceIndex -gt 0) 'Core checks must identify the address and route they tested.'
         Assert-Result (-not $triage.ExternalIP -and -not $triage.Latency.DNS_ProbeName) 'Built-in public probes were enabled.'
         Assert-Result (Test-Path -LiteralPath ([System.IO.Path]::ChangeExtension($exportPath, 'txt'))) 'Text summary is missing.'
+
+        $defaultPath = Join-Path $tempRoot 'DefaultRoute.json'
+        & (Join-Path $repo 'Invoke-NetTriage.ps1') -NonInteractive -SkipPublicProbes `
+            -CoreInfrastructurePath $configPath -PingCount 1 -ExportPath $defaultPath -RetainCount 0
+        $default = Get-Content -LiteralPath $defaultPath -Raw | ConvertFrom-Json
+        Assert-Result (-not $default.Network.Route.Error -and $default.Network.Route.InterfaceIndex -gt 0) 'The native default route lookup failed.'
+        Assert-Result ($default.Network.Route.Selection -in @('DefaultIPv4', 'DefaultIPv6')) 'A target-free run must identify its default route policy.'
+        if ($default.Network.Gateway) {
+            Assert-Result ($default.Latency.Gateway.Target -eq $default.Network.Gateway) 'Gateway latency did not use the selected route.'
+        }
+        if ($default.Network.DNS.Count -gt 0) {
+            Assert-Result ($default.Latency.DNS.Target -eq $default.Network.DNS[0]) 'DNS-server latency did not use the selected interface.'
+        }
 
         $listener.Stop()
         $afterPath = Join-Path $tempRoot 'TriageAfter.json'
@@ -82,6 +97,30 @@ try {
         Assert-Result ($summary -match 'Skipped steps\s+: .*DISM component-store cleanup.*Reboot \(shutdown /r\)') 'Tune-up WhatIf omitted expected skipped steps.'
     }
     Write-Host 'Endpoint Tune-Up phase selection and dry-run checks passed.'
+
+    & {
+        function ipconfig.exe {
+            $arguments = $args -join ' '
+            if ($arguments -notin @('/all', '/flushdns', '/registerdns')) { throw "Unexpected ipconfig action $arguments" }
+            $global:LASTEXITCODE = 0
+            'Fixture network state'
+        }
+        function netsh.exe { throw 'RemoteSafe invoked netsh.' }
+        function nbtstat.exe { throw 'RemoteSafe invoked nbtstat.' }
+        function Restart-NetAdapter { throw 'RemoteSafe restarted an adapter.' }
+        function Get-NetAdapterPowerManagement { throw 'RemoteSafe entered NIC power management.' }
+        function shutdown.exe { throw 'RemoteSafe invoked shutdown.' }
+        $remotePath = Join-Path $tempRoot 'RemoteSafe.json'
+        $null = & (Join-Path $repo 'Invoke-EndpointTuneUp.ps1') -Phase Network -RemoteSafe -Reboot -Force `
+            -NonInteractive -Quiet -LogDirectory $tempRoot -ReportPath $remotePath -LogRetentionDays 0
+        $remote = Get-Content -LiteralPath $remotePath -Raw | ConvertFrom-Json
+        Assert-Result (-not $remote.FatalError -and $remote.FailedSteps.Count -eq 0) 'RemoteSafe invoked a prohibited operation.'
+        Assert-Result ($remote.NetworkSafety.State -in @('StaticDetected', 'NoManualAddresses')) 'The native IP preflight could not classify this runner.'
+        $protected = @($remote.Steps | Where-Object { $_.Error -eq 'Skipped by -RemoteSafe' })
+        Assert-Result ($protected.Count -eq 9) 'RemoteSafe must skip every disruptive network step and the requested reboot.'
+        Assert-Result (@($remote.Steps | Where-Object { $_.Phase -eq 'Network' -and $_.Status -eq 'Success' }).Count -eq 4) 'RemoteSafe should retain network snapshots and DNS cache operations.'
+    }
+    Write-Host 'RemoteSafe entry-point policy checks passed.'
 
     if ($RunMaintenance) {
         $maintenancePath = Join-Path $tempRoot 'Maintenance.json'

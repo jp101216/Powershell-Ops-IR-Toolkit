@@ -9,8 +9,8 @@
       - Performance snapshot (CPU, memory, disk free space + disk latency, top
         processes by real-time CPU% and working set)
       - Network config (adapters, IPv4/IPv6, gateway, DNS)
-      - VPN detection (Cisco Secure Client + Zscaler via per-user SID hive,
-        including tunnel adapter IP for either client)
+      - VPN client activity and active tunnel-interface evidence
+      - Destination route, source address, and interface DNS configuration
       - Proxy configuration (WinHTTP + per-user IE/WinInet settings)
       - Latency/quality metrics (RTT + packet loss to gateway/DNS, DNS resolve time)
       - Core infrastructure health (TCP reachability + connect latency)
@@ -289,9 +289,14 @@ function Test-TcpPort {
         $result.Error = 'No host specified'
         return $result
     }
-    $client = New-Object System.Net.Sockets.TcpClient
+    $client = $null
     $waitHandle = $null
     try {
+        $address = $null
+        if ([System.Net.IPAddress]::TryParse($ComputerName, [ref]$address)) {
+            $client = New-Object System.Net.Sockets.TcpClient -ArgumentList $address.AddressFamily
+        }
+        else { $client = New-Object System.Net.Sockets.TcpClient }
         $sw  = [System.Diagnostics.Stopwatch]::StartNew()
         $iar = $client.BeginConnect($ComputerName, $Port, $null, $null)
         $waitHandle = $iar.AsyncWaitHandle
@@ -309,7 +314,7 @@ function Test-TcpPort {
         $result.Error = $_.Exception.Message
     }
     finally {
-        $client.Close()
+        if ($null -ne $client) { $client.Close() }
         if ($null -ne $waitHandle) { $waitHandle.Dispose() }
     }
     return $result
@@ -397,6 +402,188 @@ function Get-PendingReboot {
     }
     catch { }
     return [ordered]@{ Pending = ($reasons.Count -gt 0); Reasons = ($reasons -join ', ') }
+}
+
+function Resolve-DiagnosticTarget {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $result = [pscustomobject]@{ Address = $null; Addresses = @(); Error = $null }
+    try {
+        $address = $null
+        if ([System.Net.IPAddress]::TryParse($Name, [ref]$address)) {
+            $result.Addresses = @($address.ToString())
+        }
+        else {
+            $result.Addresses = @([System.Net.Dns]::GetHostAddresses($Name) |
+                ForEach-Object { $_.ToString() } | Select-Object -Unique)
+        }
+        if ($result.Addresses.Count -eq 0) { throw 'The resolver returned no IP addresses.' }
+        $result.Address = $result.Addresses[0]
+    }
+    catch { $result.Error = $_.Exception.Message }
+    return $result
+}
+
+function Get-DiagnosticRoute {
+    param([string]$RemoteAddress)
+    $context = [pscustomobject]@{
+        RemoteAddress = $RemoteAddress
+        Selection = 'Destination'
+        InterfaceIndex = $null
+        InterfaceAlias = $null
+        LocalAddress = $null
+        NextHop = $null
+        DestinationPrefix = $null
+        DNSServers = @()
+        Error = $null
+        DNSError = $null
+    }
+    try {
+        if ($RemoteAddress) {
+            $selected = @(Find-NetRoute -RemoteIPAddress $RemoteAddress -ErrorAction Stop)
+            $route = $selected | Where-Object { $_.PSObject.Properties['DestinationPrefix'] } | Select-Object -First 1
+            $local = $selected | Where-Object { $_.PSObject.Properties['IPAddress'] } | Select-Object -First 1
+            if ($local) { $context.LocalAddress = $local.IPAddress }
+        }
+        else {
+            $routes = @(Get-NetRoute -ErrorAction Stop |
+                Where-Object { $_.DestinationPrefix -in @('0.0.0.0/0', '::/0') })
+            $interfaces = @(Get-NetIPInterface -ErrorAction Stop | Where-Object { $_.ConnectionState -eq 'Connected' })
+            $routes = @($routes | Where-Object {
+                $candidate = $_
+                @($interfaces | Where-Object {
+                    $_.InterfaceIndex -eq $candidate.InterfaceIndex -and
+                    [string]$_.AddressFamily -eq [string]$candidate.AddressFamily
+                }).Count -gt 0
+            })
+            $ipv4 = @($routes | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' })
+            $context.Selection = 'DefaultIPv6'
+            if ($ipv4.Count -gt 0) { $routes = $ipv4; $context.Selection = 'DefaultIPv4' }
+            $route = $routes | Sort-Object @{ Expression = { [long]$_.RouteMetric + [long]$_.InterfaceMetric } }, InterfaceIndex |
+                Select-Object -First 1
+        }
+        if ($null -eq $route) { throw 'Windows returned no usable route.' }
+        $context.InterfaceIndex = $route.InterfaceIndex
+        $context.InterfaceAlias = $route.InterfaceAlias
+        $context.NextHop = $route.NextHop
+        $context.DestinationPrefix = $route.DestinationPrefix
+        try {
+            $context.DNSServers = @(Get-DnsClientServerAddress -InterfaceIndex $route.InterfaceIndex -ErrorAction Stop |
+                ForEach-Object { $_.ServerAddresses } | Where-Object { $_ } | ForEach-Object {
+                    $serverAddress = $null
+                    if ([System.Net.IPAddress]::TryParse($_, [ref]$serverAddress) -and
+                        $serverAddress.IsIPv6LinkLocal -and $serverAddress.ScopeId -eq 0) {
+                        "$_%$($route.InterfaceIndex)"
+                    }
+                    else { $_ }
+                } | Select-Object -Unique)
+        }
+        catch { $context.DNSError = $_.Exception.Message }
+    }
+    catch { $context.Error = $_.Exception.Message }
+    return $context
+}
+
+function Test-ResolvedTcpPort {
+    param($Resolution, [int]$Port, [int]$TimeoutMs)
+    $result = [pscustomobject]@{
+        Success = $false; LatencyMs = $null; Error = $Resolution.Error
+        ResolvedAddress = $null; Route = $null; Attempts = @()
+    }
+    if ($Resolution.Error) { return $result }
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    for ($i = 0; $i -lt $Resolution.Addresses.Count; $i++) {
+        $remaining = $TimeoutMs - [int]$clock.Elapsed.TotalMilliseconds
+        if ($remaining -le 0) { break }
+        $budget = [math]::Max(1, [math]::Floor($remaining / ($Resolution.Addresses.Count - $i)))
+        $address = $Resolution.Addresses[$i]
+        $probe = Test-TcpPort -ComputerName $address -Port $Port -TimeoutMs $budget
+        $result.ResolvedAddress = $address
+        $result.Attempts += [pscustomobject]@{
+            Address = $address; Success = $probe.Success; LatencyMs = $probe.LatencyMs; Error = $probe.Error
+        }
+        if ($probe.Success) {
+            $result.Success = $true
+            $result.LatencyMs = $probe.LatencyMs
+            break
+        }
+    }
+    if ($result.ResolvedAddress) {
+        $result.Route = Get-DiagnosticRoute -RemoteAddress $result.ResolvedAddress
+    }
+    if (-not $result.Success) {
+        $details = @($result.Attempts | ForEach-Object { "$($_.Address) - $($_.Error)" })
+        if ($result.Attempts.Count -lt $Resolution.Addresses.Count) { $details += 'TCP probe time budget exhausted.' }
+        $result.Error = $details -join ' | '
+    }
+    return $result
+}
+
+function Get-VpnEvidence {
+    $evidence = [pscustomobject]@{
+        Clients = @()
+        Tunnels = @()
+        Errors = @()
+        Summary = 'No VPN indicators detected'
+    }
+    foreach ($provider in @(
+        @{ Name = 'Cisco Secure Client'; Services = @('vpnagent'); Processes = @('vpnui', 'vpnagent'); Pattern = 'Cisco.*(AnyConnect|Secure Client)|AnyConnect' }
+        @{ Name = 'Zscaler'; Services = @('ZSATunnel', 'ZSAService'); Processes = @('ZSATunnel', 'ZSAService'); Pattern = 'Zscaler' }
+    )) {
+        $running = @(Get-Service -Name $provider.Services -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' }).Count -gt 0
+        $processes = @(Get-Process -Name $provider.Processes -ErrorAction SilentlyContinue)
+        $evidence.Clients += [pscustomobject]@{
+            Name = $provider.Name; Pattern = $provider.Pattern
+            Running = ($running -or $processes.Count -gt 0)
+            TunnelObserved = $false
+        }
+    }
+    try {
+        $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {
+            $_.Status -eq 'Up' -and $_.InterfaceDescription -match
+                'Cisco.*(AnyConnect|Secure Client)|AnyConnect|Zscaler|VPN|WireGuard|Wintun|TAP-Windows|OpenVPN|GlobalProtect|Fortinet|FortiClient|SonicWall'
+        })
+        foreach ($adapter in $adapters) {
+            try {
+                $addresses = @(Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -Type Unicast -ErrorAction Stop |
+                    Where-Object {
+                        $parsed = $null
+                        $_.AddressState -eq 'Preferred' -and -not $_.SkipAsSource -and
+                        [System.Net.IPAddress]::TryParse($_.IPAddress, [ref]$parsed) -and
+                        -not [System.Net.IPAddress]::IsLoopback($parsed) -and
+                        -not $parsed.Equals([System.Net.IPAddress]::Any) -and
+                        -not $parsed.Equals([System.Net.IPAddress]::IPv6Any) -and
+                        -not $parsed.IsIPv6LinkLocal -and $_.IPAddress -notlike '169.254.*'
+                    } | Select-Object -ExpandProperty IPAddress)
+                if ($addresses.Count -eq 0) { continue }
+                $providerName = 'Unidentified VPN'
+                foreach ($client in $evidence.Clients) {
+                    if ($adapter.InterfaceDescription -match $client.Pattern) {
+                        $client.TunnelObserved = $true
+                        $providerName = $client.Name
+                    }
+                }
+                $evidence.Tunnels += [pscustomobject]@{
+                    Provider = $providerName; InterfaceIndex = $adapter.ifIndex
+                    InterfaceAlias = $adapter.Name; Description = $adapter.InterfaceDescription
+                    Addresses = $addresses
+                }
+            }
+            catch { $evidence.Errors += "$($adapter.Name) tunnel inspection failed. $($_.Exception.Message)" }
+        }
+    }
+    catch { $evidence.Errors += $_.Exception.Message }
+    $states = @(
+        foreach ($client in $evidence.Clients) {
+            if ($client.TunnelObserved) { "Tunnel interface active - $($client.Name)" }
+            elseif ($client.Running) { "Client running - tunnel unverified - $($client.Name)" }
+        }
+        foreach ($tunnel in $evidence.Tunnels | Where-Object { $_.Provider -eq 'Unidentified VPN' }) {
+            "VPN interface active - $($tunnel.InterfaceAlias)"
+        }
+    )
+    if ($evidence.Errors.Count -gt 0) { $states += 'Tunnel inspection incomplete' }
+    if ($states.Count -gt 0) { $evidence.Summary = $states -join ' | ' }
+    return $evidence
 }
 
 function Get-DiskLatency {
@@ -559,6 +746,13 @@ function Build-ServiceNowSummary {
         }
     }
     if ($Data.Network.Gateway) { $L.Add(("  Gateway       : {0}" -f $Data.Network.Gateway)) }
+    if ($Data.Network.Route -and -not $Data.Network.Route.Error) {
+        $L.Add(("  Route interface  {0} (index {1})" -f $Data.Network.Route.InterfaceAlias, $Data.Network.Route.InterfaceIndex))
+        $L.Add(("  Route selection  {0}" -f $Data.Network.Route.Selection))
+        if ($Data.Network.Route.LocalAddress) {
+            $L.Add(("  Route source     {0} to {1}" -f $Data.Network.Route.LocalAddress, $Data.Network.Route.RemoteAddress))
+        }
+    }
     if ($Data.Network.DNS -and $Data.Network.DNS.Count -gt 0) {
         $L.Add(("  DNS Servers   : {0}" -f ($Data.Network.DNS -join ', ')))
     }
@@ -601,6 +795,10 @@ function Build-ServiceNowSummary {
             else {
                 $L.Add(("  [FAIL] {0} ({1}:{2}) - {3}" -f $item.Name, $item.Host, $item.Port, $item.Error))
             }
+            if ($item.Route -and -not $item.Route.Error) {
+                $L.Add(("    Via {0} (index {1}), destination {2}" -f $item.Route.InterfaceAlias, $item.Route.InterfaceIndex, $item.ResolvedAddress))
+            }
+            elseif ($item.Route) { $L.Add(("    Route unavailable  {0}" -f $item.Route.Error)) }
         }
     }
     else {
@@ -709,6 +907,13 @@ function Show-Dashboard {
         foreach ($adapter in $Data.Network.Adapters) { Write-Field 'Adapter' $adapter }
     }
     if ($Data.Network.Gateway) { Write-Field 'Gateway' $Data.Network.Gateway }
+    if ($Data.Network.Route -and -not $Data.Network.Route.Error) {
+        Write-Field 'Route interface' ("{0} (index {1})" -f $Data.Network.Route.InterfaceAlias, $Data.Network.Route.InterfaceIndex)
+        Write-Field 'Route selection' $Data.Network.Route.Selection
+        if ($Data.Network.Route.LocalAddress) {
+            Write-Field 'Route source' ("{0} to {1}" -f $Data.Network.Route.LocalAddress, $Data.Network.Route.RemoteAddress)
+        }
+    }
     if ($Data.Network.DNS -and $Data.Network.DNS.Count -gt 0) { Write-Field 'DNS Servers' ($Data.Network.DNS -join ', ') }
     if ($Data.Network.WifiSSID) {
         if ($null -ne $Data.Network.WifiSignalPct) {
@@ -829,9 +1034,13 @@ $Data = [ordered]@{
         Adapters     = @()
         Gateway      = $null
         DNS          = @()
+        AllDNS       = @()
+        Gateways     = @()
+        Route        = $null
         WifiSSID     = $null
         WifiSignalPct = $null
     }
+    VPN          = $null
     VPN_Status   = 'Not detected'
     Zscaler_State = 'Not detected'
     VPN_TunnelIP = $null
@@ -954,8 +1163,8 @@ try {
     }
     if ($adapters.Count -eq 0) { throw 'Get-NetIPConfiguration returned no adapters' }
     $Data.Network.Adapters = $adapters
-    if ($gateways.Count -gt 0) { $Data.Network.Gateway = $gateways[0] }
-    $Data.Network.DNS = @($dnsServers | Select-Object -Unique)
+    $Data.Network.Gateways = @($gateways | Select-Object -Unique)
+    $Data.Network.AllDNS = @($dnsServers | Select-Object -Unique)
 }
 catch {
     # Fallback: CIM adapter configuration, for hosts without the NetTCPIP module.
@@ -972,8 +1181,8 @@ catch {
             if ($cim.DNSServerSearchOrder) { $dnsServers += $cim.DNSServerSearchOrder }
         }
         $Data.Network.Adapters = $adapters
-        if ($gateways.Count -gt 0) { $Data.Network.Gateway = $gateways[0] }
-        $Data.Network.DNS = @($dnsServers | Select-Object -Unique)
+        $Data.Network.Gateways = @($gateways | Select-Object -Unique)
+        $Data.Network.AllDNS = @($dnsServers | Select-Object -Unique)
     }
     catch {
         Write-Warning "Network config collection failed: $($_.Exception.Message)"
@@ -989,47 +1198,16 @@ try {
 }
 catch { }
 
-# ---- VPN detection (Cisco Secure Client + Zscaler, via processes/services) ----
-try {
-    $ciscoRunning = $false
-    $zscalerRunning = $false
-    $ciscoSvc = @(Get-Service -Name 'vpnagent' -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' })
-    if ($ciscoSvc.Count -gt 0) { $ciscoRunning = $true }
-    $zscalerSvc = @(Get-Service -Name 'ZSATunnel', 'ZSAService' -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' })
-    if ($zscalerSvc.Count -gt 0) { $zscalerRunning = $true }
-    $vpnProcs = @(Get-Process -Name 'vpnui', 'vpnagent', 'ZSATunnel', 'ZSAService' -ErrorAction SilentlyContinue)
-    foreach ($proc in $vpnProcs) {
-        if ($proc.ProcessName -match 'vpn') { $ciscoRunning = $true }
-        if ($proc.ProcessName -match 'ZSA') { $zscalerRunning = $true }
-    }
-    if ($zscalerRunning) { $Data.Zscaler_State = 'Running' } else { $Data.Zscaler_State = 'Not detected' }
-
-    $tunnelIP = $null
-    $tunnelDetail = $null
-    try {
-        $tunnelAdapters = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.InterfaceDescription -match 'Cisco|Zscaler|VPN|Tunnel' -and $_.Status -eq 'Up' })
-        foreach ($tunnel in $tunnelAdapters) {
-            $tunnelAddresses = @(Get-NetIPAddress -InterfaceIndex $tunnel.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
-            if ($tunnelAddresses.Count -gt 0) {
-                $tunnelIP = $tunnelAddresses[0].IPAddress
-                $tunnelDetail = $tunnel.InterfaceDescription
-                break
-            }
-        }
-    }
-    catch { }
-    $Data.VPN_TunnelIP = $tunnelIP
-    $Data.VPN_Detail = $tunnelDetail
-
-    if ($ciscoRunning -and $zscalerRunning) { $Data.VPN_Status = 'Connected - Cisco Secure Client + Zscaler' }
-    elseif ($ciscoRunning) { $Data.VPN_Status = 'Connected - Cisco Secure Client' }
-    elseif ($zscalerRunning) { $Data.VPN_Status = 'Connected - Zscaler' }
-    elseif ($tunnelIP) { $Data.VPN_Status = 'Tunnel adapter detected (client not identified)' }
-    else { $Data.VPN_Status = 'Not connected' }
+# ---- VPN client and tunnel-interface evidence ----
+$Data.VPN = Get-VpnEvidence
+$Data.VPN_Status = $Data.VPN.Summary
+$zscalerClient = $Data.VPN.Clients | Where-Object { $_.Name -eq 'Zscaler' }
+if ($zscalerClient.Running) { $Data.Zscaler_State = 'Running' }
+if ($Data.VPN.Tunnels.Count -gt 0) {
+    $Data.VPN_TunnelIP = $Data.VPN.Tunnels[0].Addresses[0]
+    $Data.VPN_Detail = $Data.VPN.Tunnels[0].Description
 }
-catch {
-    Write-Warning "VPN detection failed: $($_.Exception.Message)"
-}
+foreach ($vpnError in $Data.VPN.Errors) { Add-Finding 'Warn' "VPN inspection incomplete - $vpnError" }
 
 # ---- Proxy ----
 try {
@@ -1038,6 +1216,63 @@ try {
     $Data.Proxy_IE = $proxy.IE
 }
 catch { }
+
+# ---- Single-target diagnostic and its selected route ----
+if (-not [string]::IsNullOrWhiteSpace($TargetDestination)) {
+    $resolved = Resolve-DiagnosticTarget -Name $TargetDestination
+    $targetPortsData = @(foreach ($port in $TargetPorts) {
+        $probe = Test-ResolvedTcpPort -Resolution $resolved -Port $port -TimeoutMs $TcpTimeoutMs
+        [pscustomobject]@{
+            Port = $port; Success = $probe.Success; LatencyMs = $probe.LatencyMs; Error = $probe.Error
+            ResolvedAddress = $probe.ResolvedAddress; Route = $probe.Route; Attempts = $probe.Attempts
+        }
+    })
+    $primaryProbe = $targetPortsData | Where-Object { $_.Success } | Select-Object -First 1
+    if (-not $primaryProbe) { $primaryProbe = $targetPortsData | Select-Object -First 1 }
+    $selectedAddress = $null
+    $Data.Network.Route = $null
+    if ($primaryProbe) {
+        $selectedAddress = $primaryProbe.ResolvedAddress
+        $Data.Network.Route = $primaryProbe.Route
+    }
+    if (-not $selectedAddress) { $selectedAddress = $resolved.Address }
+    if (-not $Data.Network.Route) {
+        if ($selectedAddress) { $Data.Network.Route = Get-DiagnosticRoute -RemoteAddress $selectedAddress }
+        else { $Data.Network.Route = [pscustomobject]@{ Error = $resolved.Error } }
+    }
+    $Data.Target = [ordered]@{
+        Destination = $TargetDestination
+        DNS_Resolved = $selectedAddress
+        ResolvedAddresses = $resolved.Addresses
+        DNS_Error = $resolved.Error
+        Route = $Data.Network.Route
+        Ping = $null
+        Ports = $targetPortsData
+    }
+    if ($selectedAddress) {
+        $Data.Target.Ping = Get-PingStats -ComputerName $selectedAddress -Count $PingCount -TimeoutMs $PingTimeoutMs
+    }
+}
+else { $Data.Network.Route = Get-DiagnosticRoute }
+if ($Data.Network.Route.Error) {
+    Add-Finding 'Warn' "Route selection unavailable - $($Data.Network.Route.Error)"
+}
+else {
+    $nextHop = $Data.Network.Route.NextHop
+    $nextHopAddress = $null
+    if ([System.Net.IPAddress]::TryParse($nextHop, [ref]$nextHopAddress) -and
+        -not $nextHopAddress.Equals([System.Net.IPAddress]::Any) -and
+        -not $nextHopAddress.Equals([System.Net.IPAddress]::IPv6Any)) {
+        if ($nextHopAddress.IsIPv6LinkLocal -and $nextHopAddress.ScopeId -eq 0) {
+            $nextHop += '%' + $Data.Network.Route.InterfaceIndex
+        }
+        $Data.Network.Gateway = $nextHop
+    }
+    $Data.Network.DNS = @($Data.Network.Route.DNSServers)
+    if ($Data.Network.Route.DNSError) {
+        Add-Finding 'Warn' "Selected-interface DNS configuration unavailable - $($Data.Network.Route.DNSError)"
+    }
+}
 
 # ---- Latency / quality ----
 if ($Data.Network.Gateway) {
@@ -1066,62 +1301,21 @@ if ($DnsProbeName) {
 # ---- Core infrastructure reachability ----
 $coreResults = @()
 foreach ($targetItem in $CoreInfrastructure) {
-    $tcpResult = Test-TcpPort -ComputerName $targetItem.Host -Port ([int]$targetItem.Port) -TimeoutMs $TcpTimeoutMs
+    $resolved = Resolve-DiagnosticTarget -Name $targetItem.Host
+    $tcpResult = Test-ResolvedTcpPort -Resolution $resolved -Port ([int]$targetItem.Port) -TimeoutMs $TcpTimeoutMs
     $coreResults += [ordered]@{
         Name = $targetItem.Name
         Host = $targetItem.Host
         Port = [int]$targetItem.Port
+        ResolvedAddress = $tcpResult.ResolvedAddress
+        Route = $tcpResult.Route
+        Attempts = $tcpResult.Attempts
         Success = $tcpResult.Success
         LatencyMs = $tcpResult.LatencyMs
         Error = $tcpResult.Error
     }
 }
 $Data.CoreInfrastructure = $coreResults
-
-# ---- Single-target diagnostic ----
-if (-not [string]::IsNullOrWhiteSpace($TargetDestination)) {
-    $targetData = [ordered]@{
-        Destination = $TargetDestination
-        DNS_Resolved = $null
-        Ping = $null
-        Ports = @()
-    }
-    $isIP = $false
-    $ipAddress = $null
-    if ([System.Net.IPAddress]::TryParse($TargetDestination, [ref]$ipAddress)) { $isIP = $true }
-    if ($isIP) {
-        $targetData.DNS_Resolved = $TargetDestination
-    }
-    else {
-        try {
-            $dnsCmd = Get-Command -Name 'Resolve-DnsName' -ErrorAction SilentlyContinue
-            if ($dnsCmd) {
-                $resolved = Resolve-DnsName -Name $TargetDestination -Type A -ErrorAction Stop | Select-Object -First 1
-                if ($resolved -and $resolved.IPAddress) { $targetData.DNS_Resolved = $resolved.IPAddress }
-            }
-            else {
-                $addresses = [System.Net.Dns]::GetHostAddresses($TargetDestination)
-                if ($addresses -and $addresses.Count -gt 0) { $targetData.DNS_Resolved = $addresses[0].ToString() }
-            }
-        }
-        catch {
-            $targetData.DNS_Resolved = $null
-        }
-    }
-    $targetData.Ping = Get-PingStats -ComputerName $TargetDestination -Count $PingCount -TimeoutMs $PingTimeoutMs
-    $portResults = @()
-    foreach ($port in $TargetPorts) {
-        $tcpResult = Test-TcpPort -ComputerName $TargetDestination -Port ([int]$port) -TimeoutMs $TcpTimeoutMs
-        $portResults += [ordered]@{
-            Port = [int]$port
-            Success = $tcpResult.Success
-            LatencyMs = $tcpResult.LatencyMs
-            Error = $tcpResult.Error
-        }
-    }
-    $targetData.Ports = $portResults
-    $Data.Target = $targetData
-}
 
 # ---- Egress IP ----
 if (-not $SkipExternalIP -and -not $SkipPublicProbes) {
