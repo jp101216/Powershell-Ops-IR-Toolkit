@@ -51,6 +51,18 @@ try {
         Assert-Result ($triage.Target.Ports.Count -eq 1 -and $triage.Target.Ports[0].Success) 'Single-target TCP probe failed.'
         Assert-Result (-not $triage.ExternalIP -and -not $triage.Latency.DNS_ProbeName) 'Built-in public probes were enabled.'
         Assert-Result (Test-Path -LiteralPath ([System.IO.Path]::ChangeExtension($exportPath, 'txt'))) 'Text summary is missing.'
+
+        $listener.Stop()
+        $afterPath = Join-Path $tempRoot 'TriageAfter.json'
+        & (Join-Path $repo 'Invoke-NetTriage.ps1') -NonInteractive -SkipPublicProbes `
+            -CoreInfrastructurePath $configPath -TargetDestination '127.0.0.1' -TargetPorts $port `
+            -PingCount 1 -ExportPath $afterPath -RetainCount 0
+        $comparisonPath = Join-Path $tempRoot 'NativeComparison.json'
+        & (Join-Path $repo 'Compare-NetTriage.ps1') $exportPath $afterPath -Quiet -ExportPath $comparisonPath | Out-Null
+        $comparison = Get-Content -LiteralPath $comparisonPath -Raw | ConvertFrom-Json
+        $tcpChanges = @($comparison.Checks | Where-Object { $_.Category -in @('Core', 'Target') })
+        Assert-Result ($tcpChanges.Count -eq 2 -and @($tcpChanges | Where-Object { $_.Change -ne 'Regressed' }).Count -eq 0) 'The native before-and-after comparison missed the stopped TCP listener.'
+        Write-Host 'NetTriage native round-trip comparison passed.'
     }
     finally { $listener.Stop() }
     Write-Host 'NetTriage loopback and export checks passed.'
