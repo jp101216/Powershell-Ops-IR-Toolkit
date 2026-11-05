@@ -119,6 +119,34 @@ The JSON export includes the same findings shown in the ticket summary.
 
 ---
 
+## Compare-NetTriage.ps1
+
+Compare two saved NetTriage exports from the same endpoint after a troubleshooting change. The command runs offline and produces a JSON comparison plus a ServiceNow-ready text summary.
+
+It tracks recovered checks, regressions, continuing failures, TCP and DNS latency changes, ICMP quality, and pending-reboot status. Checks use their destination and port as the comparison identity. Added or removed targets and missing measurements are visible in the report.
+
+```powershell
+# Capture the baseline
+.\Invoke-NetTriage.ps1 -TargetDestination intranet.example.com -NonInteractive -ExportPath .\before.json
+
+# Capture the follow-up after troubleshooting
+.\Invoke-NetTriage.ps1 -TargetDestination intranet.example.com -NonInteractive -ExportPath .\after.json
+
+# Generate the ticket-ready comparison
+.\Compare-NetTriage.ps1 .\before.json .\after.json -Quiet -ExportPath .\comparison.json
+```
+
+| Parameter | Behavior |
+|---|---|
+| `-BeforePath`, `-AfterPath` | NetTriage JSON exports identifying the same computer |
+| `-ExportPath` | New JSON output path with a matching text summary. Defaults to a unique pair in the local NetTriage folder. |
+| `-Quiet` | Emit the plain-text summary to the success stream |
+| `-CopyToClipboard` | Also copy the summary to the clipboard |
+
+Older exports are supported. Missing timestamps, ambiguous duplicate endpoints, and unnamed legacy DNS probes appear as comparison gaps. Existing output files are protected from replacement.
+
+---
+
 ## Invoke-EndpointTuneUp.ps1
 
 Network-stack reset/repair plus disk cleanup and optimization, designed to run in an elevated remote-support session. Three phases: **Network** (DNS flush/re-register, ARP/NetBIOS purge, TCP autotuning reset, disable NIC power-saving, Winsock/TCP-IP stack reset, adapter restart, DHCP release/renew), **Cleanup** (temp files across all profiles, optional Recycle Bin, optional DISM/SFC), **Optimize** (volume TRIM/defrag, `gpupdate /force`, SCCM/MECM client policy + inventory triggers).
