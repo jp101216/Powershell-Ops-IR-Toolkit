@@ -3,14 +3,15 @@
 [CmdletBinding()]
 param(
     [switch]$IncludeWindowsUpdateScan,
-    [switch]$RunMaintenance
+    [switch]$RunMaintenance,
+    [switch]$InstallTestDriver
 )
 
 $ErrorActionPreference = 'Stop'
 if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
     throw 'This smoke test requires Windows.'
 }
-if ($RunMaintenance -and ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted')) {
+if (($RunMaintenance -or $InstallTestDriver) -and ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted')) {
     throw 'Native maintenance tests require a disposable GitHub-hosted runner.'
 }
 
@@ -95,6 +96,20 @@ try {
         }
         else {
             Write-Host "Windows Update scan status: $($update.WindowsUpdate.ScanStatus). Applicable updates: $($update.WindowsUpdate.Found)."
+        }
+        if ($InstallTestDriver) {
+            $candidate = @($update.WindowsUpdate.Updates | Where-Object {
+                $_.Title -like 'Microsoft Corporation AudioProcessingObject Driver Update (*)' -and $_.UpdateId
+            } | Select-Object -First 1)
+            if ($candidate.Count -eq 1 -and $update.WindowsUpdate.ScanStatus -eq 'Succeeded') {
+                & (Join-Path $repo 'Invoke-UpdateSystem.ps1') -AutoInstall -NonInteractive -SkipBiosRouting `
+                    -UpdateId $candidate[0].UpdateId -LogDirectory $tempRoot -ReportPath $updatePath
+                $installed = Get-Content -LiteralPath $updatePath -Raw | ConvertFrom-Json
+                Assert-Result ($installed.WindowsUpdate.InstallStatus -eq 'Succeeded' -and $installed.WindowsUpdate.Updates.Count -eq 1) 'The selected native driver installation failed.'
+                Assert-Result ($installed.WindowsUpdate.Updates[0].UpdateId -eq $candidate[0].UpdateId) 'The installation report identifies a different update.'
+                Write-Host "Native driver installation passed. Reboot required: $($installed.RebootRequired)."
+            }
+            else { Write-Warning 'The known audio driver was unavailable. Native driver installation was skipped.' }
         }
     }
 }

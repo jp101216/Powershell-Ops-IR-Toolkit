@@ -175,6 +175,7 @@ powershell -File .\Invoke-UpdateSystem.ps1 -AutoInstall -NonInteractive
 | Parameter | Notes |
 |---|---|
 | `-ScanOnly` | Report available updates and the OEM recommendation |
+| `-UpdateId` | Limit the scan or installation to the exact update IDs recorded in a prior JSON report |
 | `-WhatIf` | Preview update actions without creating a transcript or JSON report |
 | `-AutoInstall` | Apply driver/firmware updates without an interactive prompt |
 | `-IncludeApps` | Also offer app upgrades via winget. Use `-Force` to approve app and OEM-tool installs in unattended runs. |

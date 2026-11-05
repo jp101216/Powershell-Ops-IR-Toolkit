@@ -40,4 +40,4 @@ jobs:
           persist-credentials: false
       - name: Check toolkit and run maintenance
         shell: pwsh
-        run: ./tests/Test-Toolkit.ps1 -IncludeWindowsUpdateScan -RunMaintenance
+        run: ./tests/Test-Toolkit.ps1 -IncludeWindowsUpdateScan -RunMaintenance -InstallTestDriver

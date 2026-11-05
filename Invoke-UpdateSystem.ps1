@@ -52,6 +52,10 @@
     recommendation without entering the menu or applying updates. Scans use
     the configured Windows Update source and write the usual audit report.
 
+.PARAMETER UpdateId
+    Limit the scan or installation to these exact Windows Update identities.
+    Identities are included in each update's JSON report entry.
+
 .PARAMETER IncludeApps
     Also run `winget upgrade --all` for installed applications.
 
@@ -109,6 +113,8 @@
 param(
     [switch]$AutoInstall,
     [switch]$ScanOnly,
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string[]]$UpdateId,
     [switch]$IncludeApps,
     [switch]$NonInteractive,
     [switch]$Force,
@@ -287,6 +293,7 @@ function Invoke-WindowsUpdateDrivers {
     $installResult = $null
 
     $summary = [pscustomobject]@{
+        Available      = 0
         Found          = 0
         Titles         = @()
         ScanStatus     = 'Failed'
@@ -319,7 +326,17 @@ function Invoke-WindowsUpdateDrivers {
             Write-Warn $message
         }
 
-        $summary.Found = $result.Updates.Count
+        $summary.Available = $result.Updates.Count
+        $matchedUpdates = @($result.Updates)
+        if ($UpdateId) {
+            $matchedUpdates = @($matchedUpdates | Where-Object { $UpdateId -contains $_.Identity.UpdateID })
+            $matchedIds = @($matchedUpdates | ForEach-Object { $_.Identity.UpdateID })
+            $missingIds = @($UpdateId | Where-Object { $_ -notin $matchedIds })
+            if ($missingIds.Count -gt 0) {
+                throw "Requested update identities were not returned by the search: $($missingIds -join ', ')."
+            }
+        }
+        $summary.Found = $matchedUpdates.Count
         if ($summary.Found -eq 0) {
             if ($summary.ScanStatus -eq 'Succeeded') {
                 Write-Good 'No driver/firmware updates available from the configured source.'
@@ -328,10 +345,13 @@ function Invoke-WindowsUpdateDrivers {
             return $summary
         }
         Write-Warn "$($summary.Found) update(s) found:"
-        $summary.Updates = @(foreach ($update in $result.Updates) {
+        $summary.Updates = @(foreach ($update in $matchedUpdates) {
             Write-Host "    - $($update.Title)" -ForegroundColor White
+            $identity = $null
+            try { $identity = $update.Identity.UpdateID } catch { }
             [pscustomobject]@{
                 Title              = $update.Title
+                UpdateId           = $identity
                 DownloadResultCode = $null
                 DownloadHResult    = $null
                 InstallResultCode  = $null
@@ -354,7 +374,7 @@ function Invoke-WindowsUpdateDrivers {
 
         $summary.InstallStatus = 'Failed'
         $toDownload = New-Object -ComObject 'Microsoft.Update.UpdateColl' -ErrorAction Stop
-        foreach ($update in $result.Updates) {
+        foreach ($update in $matchedUpdates) {
             if (-not $update.EulaAccepted) { $update.AcceptEula() | Out-Null }
             $toDownload.Add($update) | Out-Null
         }
@@ -427,6 +447,7 @@ function Invoke-WindowsUpdateDrivers {
     catch {
         Write-Bad "Windows Update failed: $($_.Exception.Message)"
         $summary.InstallErrors += $_.Exception.Message
+        if ($Apply) { $summary.InstallStatus = 'Failed' }
         return $summary
     }
     finally {
