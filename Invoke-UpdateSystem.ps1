@@ -238,17 +238,17 @@ function Get-SystemInfo {
     if ($RedactSerial) { $serial = 'REDACTED' }
 
     $info = [pscustomobject]@{
-        Manufacturer = if ($null -ne $cs) { $cs.Manufacturer }
-        Model        = if ($null -ne $cs) { $cs.Model }
+        Manufacturer = $(if ($null -ne $cs) { $cs.Manufacturer })
+        Model        = $(if ($null -ne $cs) { $cs.Model })
         IsPortable   = ($null -ne $cs -and $cs.PCSystemType -eq 2)
-        Motherboard  = if ($null -ne $bb) { "$($bb.Manufacturer) $($bb.Product)".Trim() }
+        Motherboard  = $(if ($null -ne $bb) { "$($bb.Manufacturer) $($bb.Product)".Trim() })
         Serial       = $serial
-        BiosVersion  = if ($null -ne $bios) { $bios.SMBIOSBIOSVersion }
+        BiosVersion  = $(if ($null -ne $bios) { $bios.SMBIOSBIOSVersion })
         BiosDate     = $biosDate
-        OS           = if ($null -ne $os) { $os.Caption }
-        OSBuild      = if ($null -ne $os) { $os.BuildNumber }
-        OSVersion    = if ($null -ne $os) { $os.Version }
-        Architecture = if ($null -ne $os) { $os.OSArchitecture }
+        OS           = $(if ($null -ne $os) { $os.Caption })
+        OSBuild      = $(if ($null -ne $os) { $os.BuildNumber })
+        OSVersion    = $(if ($null -ne $os) { $os.Version })
+        Architecture = $(if ($null -ne $os) { $os.OSArchitecture })
     }
 
     $info | Format-List | Out-String | Write-Host
@@ -290,7 +290,7 @@ function Invoke-WindowsUpdateDrivers {
         Found          = 0
         Titles         = @()
         ScanStatus     = 'Failed'
-        InstallStatus  = if ($Apply) { 'NotStarted' } else { 'NotRequested' }
+        InstallStatus  = $(if ($Apply) { 'NotStarted' } else { 'NotRequested' })
         Updates        = @()
         Installed      = $false
         InstallErrors  = @()
